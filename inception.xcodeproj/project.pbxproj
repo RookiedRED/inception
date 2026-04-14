@@ -6,8 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		612E1D252F8EDE9B00F8E603 /* yolov8n-seg.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 612E1D242F8EDE9B00F8E603 /* yolov8n-seg.mlpackage */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		612E1CE92F8EDE5000F8E603 /* inception.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = inception.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		612E1D242F8EDE9B00F8E603 /* yolov8n-seg.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = "yolov8n-seg.mlpackage"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -34,6 +39,7 @@
 			children = (
 				612E1CEB2F8EDE5000F8E603 /* inception */,
 				612E1CEA2F8EDE5000F8E603 /* Products */,
+				612E1D242F8EDE9B00F8E603 /* yolov8n-seg.mlpackage */,
 			);
 			sourceTree = "<group>";
 		};
@@ -119,6 +125,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				612E1D252F8EDE9B00F8E603 /* yolov8n-seg.mlpackage in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

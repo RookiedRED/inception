@@ -40,6 +40,8 @@ final class DriveViewModel: ObservableObject {
     private var isInferring = false
     private var didSetupPipeline = false
     private var latestCameraTimestamp: TimeInterval = 0
+    private var latestTrackedObjectsTimestamp: TimeInterval = 0
+    private let objectProcessingQueue = DispatchQueue(label: "com.idrivebot.minimap.objects", qos: .userInitiated)
 
     // MARK: - Lifecycle
 
@@ -99,6 +101,7 @@ final class DriveViewModel: ObservableObject {
             self.latestCameraTimestamp = context.timestamp
             self.cameraPixelBuffer = pixelBuffer
             self.imageResolution = context.imageResolution
+            self.updateMiniMapCamera(with: context)
         }
 
         frameCount += 1
@@ -126,17 +129,25 @@ final class DriveViewModel: ObservableObject {
 
                 switch result {
                 case .success(let output):
-                    let objects = self.makeDisplayObjects(
-                        from: output.detections,
-                        context: context,
-                        timestamp: context.timestamp
-                    )
-                    Task { @MainActor in
-                        self.updateMiniMapCamera(with: context)
-                        self.inferenceMs = output.inferenceMs
-                        self.miniMapService.updateTrackedObjects(objects)
-                        self.trackedObjects = objects
-                        self.detectionCount = objects.count
+                    let detections = output.detections
+                    let inferenceMs = output.inferenceMs
+                    self.objectProcessingQueue.async {
+                        let objects = Self.makeDisplayObjects(
+                            from: detections,
+                            context: context,
+                            timestamp: context.timestamp
+                        )
+
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            guard context.timestamp >= self.latestTrackedObjectsTimestamp else { return }
+
+                            self.latestTrackedObjectsTimestamp = context.timestamp
+                            self.inferenceMs = inferenceMs
+                            self.miniMapService.updateTrackedObjects(objects)
+                            self.trackedObjects = objects
+                            self.detectionCount = objects.count
+                        }
                     }
 
                 case .failure(let error):
@@ -145,10 +156,6 @@ final class DriveViewModel: ObservableObject {
             }
 
         } else {
-            Task { @MainActor in
-                self.updateMiniMapCamera(with: context)
-            }
-
             cameraService.endProcessing()
 
             // Only print occasionally to avoid log spam
@@ -159,7 +166,7 @@ final class DriveViewModel: ObservableObject {
         }
     }
 
-    private func makeDisplayObjects(
+    private nonisolated static func makeDisplayObjects(
         from detections: [Detection],
         context: ARFrameContext,
         timestamp: TimeInterval
@@ -180,7 +187,7 @@ final class DriveViewModel: ObservableObject {
         }
     }
 
-    private func estimateWorldPosition(
+    private nonisolated static func estimateWorldPosition(
         for detection: Detection,
         context: ARFrameContext
     ) -> (worldPosition: simd_float3?, depth: Float?) {
@@ -199,8 +206,8 @@ final class DriveViewModel: ObservableObject {
 
         let bbox = detection.bbox
         let imagePoint = CGPoint(
-            x: (bbox.midX * imageResolution.width).clamped(to: 0...imageResolution.width),
-            y: ((bbox.maxY - 0.02) * imageResolution.height).clamped(to: 0...imageResolution.height)
+            x: min(max(bbox.midX * imageResolution.width, 0), imageResolution.width),
+            y: min(max((bbox.maxY - 0.02) * imageResolution.height, 0), imageResolution.height)
         )
         let depthPoint = CGPoint(
             x: imagePoint.x * depthResolution.width / imageResolution.width,
@@ -227,20 +234,26 @@ final class DriveViewModel: ObservableObject {
         return (simd_float3(worldPoint.x, worldPoint.y, worldPoint.z), sampledDepth)
     }
 
-    private func sampledDepth(
+    private nonisolated static func sampledDepth(
         around point: CGPoint,
         sceneDepth: ARFrameContext.SceneDepthData
     ) -> Float? {
         let centerX = Int(point.x.rounded())
         let centerY = Int(point.y.rounded())
+        let width = Int(sceneDepth.resolution.width)
+        let height = Int(sceneDepth.resolution.height)
         var candidates: [Float] = []
         candidates.reserveCapacity(25)
 
         for offsetY in -2...2 {
             for offsetX in -2...2 {
-                if let depth = sceneDepth.depthAt(x: centerX + offsetX, y: centerY + offsetY) {
-                    candidates.append(depth)
-                }
+                let sampleX = centerX + offsetX
+                let sampleY = centerY + offsetY
+                guard sampleX >= 0, sampleX < width, sampleY >= 0, sampleY < height else { continue }
+
+                let depth = sceneDepth.values[sampleY * width + sampleX]
+                guard depth.isFinite, depth > 0 else { continue }
+                candidates.append(depth)
             }
         }
 
@@ -266,11 +279,5 @@ final class DriveViewModel: ObservableObject {
 
     func panExpandedMiniMap(by translation: CGPoint, viewportSize: CGSize) {
         miniMapService.panExpandedMap(byScreenTranslation: translation, viewportSize: viewportSize)
-    }
-}
-
-private extension Comparable {
-    func clamped(to range: ClosedRange<Self>) -> Self {
-        min(max(self, range.lowerBound), range.upperBound)
     }
 }

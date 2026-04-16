@@ -55,6 +55,9 @@ struct RootView: View {
             },
             onPanChanged: { translation, viewportSize in
                 viewModel.panExpandedMiniMap(by: translation, viewportSize: viewportSize)
+            },
+            onToggleRequested: {
+                setMiniMapExpanded(!isMiniMapExpanded)
             }
         )
             .if(isMiniMapExpanded) { view in
@@ -81,11 +84,6 @@ struct RootView: View {
             .padding(.trailing, isMiniMapExpanded ? 0 : 16)
             .padding(.bottom, isMiniMapExpanded ? 0 : 24)
             .contentShape(Rectangle())
-            .onTapGesture {
-                if !isMiniMapExpanded {
-                    setMiniMapExpanded(true)
-                }
-            }
     }
 
     private func setMiniMapExpanded(_ isExpanded: Bool) {

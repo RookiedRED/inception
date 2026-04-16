@@ -85,8 +85,8 @@ final class MiniMapService {
         translationRootNode.addChildNode(environmentRootNode)
         translationRootNode.addChildNode(objectsRootNode)
 
-        scene.rootNode.addChildNode(userMarkerNode)
-        scene.rootNode.addChildNode(headingNode)
+        panRootNode.addChildNode(userMarkerNode)
+        panRootNode.addChildNode(headingNode)
 
         scene.rootNode.addChildNode(cameraRigNode)
         cameraRigNode.addChildNode(cameraNode)

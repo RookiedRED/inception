@@ -13,9 +13,14 @@ struct MiniMapView: UIViewRepresentable {
     let isZoomEnabled: Bool
     let onZoomChanged: (Double) -> Void
     let onPanChanged: (CGPoint, CGSize) -> Void
+    let onToggleRequested: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onZoomChanged: onZoomChanged, onPanChanged: onPanChanged)
+        Coordinator(
+            onZoomChanged: onZoomChanged,
+            onPanChanged: onPanChanged,
+            onToggleRequested: onToggleRequested
+        )
     }
 
     func makeUIView(context: Context) -> SCNView {
@@ -31,11 +36,20 @@ struct MiniMapView: UIViewRepresentable {
         view.antialiasingMode = .none
         view.preferredFramesPerSecond = 30
 
+        let tapGesture = UITapGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleTap(_:))
+        )
+        tapGesture.cancelsTouchesInView = false
+        tapGesture.numberOfTouchesRequired = 1
+        view.addGestureRecognizer(tapGesture)
+
         let pinchGesture = UIPinchGestureRecognizer(
             target: context.coordinator,
             action: #selector(Coordinator.handlePinch(_:))
         )
         pinchGesture.cancelsTouchesInView = false
+        pinchGesture.delegate = context.coordinator
         view.addGestureRecognizer(pinchGesture)
 
         let panGesture = UIPanGestureRecognizer(
@@ -43,7 +57,9 @@ struct MiniMapView: UIViewRepresentable {
             action: #selector(Coordinator.handlePan(_:))
         )
         panGesture.cancelsTouchesInView = false
+        panGesture.minimumNumberOfTouches = 2
         panGesture.maximumNumberOfTouches = 2
+        panGesture.delegate = context.coordinator
         view.addGestureRecognizer(panGesture)
 
         // Performance / debug
@@ -61,13 +77,14 @@ struct MiniMapView: UIViewRepresentable {
             uiView.scene = scene
         }
         context.coordinator.setZoomEnabled(isZoomEnabled)
-        uiView.isUserInteractionEnabled = isZoomEnabled
+        uiView.isUserInteractionEnabled = true
     }
 }
 extension MiniMapView {
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         private let onZoomChanged: (Double) -> Void
         private let onPanChanged: (CGPoint, CGSize) -> Void
+        private let onToggleRequested: () -> Void
         private weak var view: SCNView?
         private var currentZoomScale: Double = 1.0
         private var gestureStartZoomScale: Double = 1.0
@@ -75,10 +92,12 @@ extension MiniMapView {
 
         init(
             onZoomChanged: @escaping (Double) -> Void,
-            onPanChanged: @escaping (CGPoint, CGSize) -> Void
+            onPanChanged: @escaping (CGPoint, CGSize) -> Void,
+            onToggleRequested: @escaping () -> Void
         ) {
             self.onZoomChanged = onZoomChanged
             self.onPanChanged = onPanChanged
+            self.onToggleRequested = onToggleRequested
         }
 
         func attach(to view: SCNView) {
@@ -90,6 +109,12 @@ extension MiniMapView {
             if !isEnabled {
                 gestureStartZoomScale = currentZoomScale
             }
+        }
+
+        @objc
+        func handleTap(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended else { return }
+            onToggleRequested()
         }
 
         @objc
@@ -118,6 +143,16 @@ extension MiniMapView {
 
             onPanChanged(translation, view.bounds.size)
             gesture.setTranslation(.zero, in: view)
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            let recognizers = [gestureRecognizer, otherGestureRecognizer]
+            let containsPinch = recognizers.contains { $0 is UIPinchGestureRecognizer }
+            let containsPan = recognizers.contains { $0 is UIPanGestureRecognizer }
+            return containsPinch && containsPan
         }
     }
 }

@@ -9,46 +9,87 @@ import SwiftUI
 
 struct RootView: View {
     @StateObject private var viewModel = DriveViewModel()
+    @State private var isMiniMapExpanded = false
 
     var body: some View {
-        ZStack {
-            CameraPreviewView(pixelBuffer: viewModel.cameraPixelBuffer)
+        GeometryReader { proxy in
+            ZStack {
+                CameraPreviewView(pixelBuffer: viewModel.cameraPixelBuffer)
+                    .ignoresSafeArea()
+
+                DetectionOverlayView(
+                    trackedObjects: viewModel.trackedObjects,
+                    orientation: viewModel.orientation,
+                    imageResolution: viewModel.imageResolution
+                )
                 .ignoresSafeArea()
 
-            DetectionOverlayView(
-                trackedObjects: viewModel.trackedObjects,
-                orientation: viewModel.orientation,
-                imageResolution: viewModel.imageResolution
-            )
-            .ignoresSafeArea()
+                miniMap()
+                
+                HUDView(
+                    inferenceMs: viewModel.inferenceMs,
+                    detectionCount: viewModel.detectionCount,
+                    orientation: viewModel.orientation
+                )
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: viewModel.orientation.isFlipped ? .bottom : .top
+                )
+                .padding(.all, 16)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea()   // <- 加這裡
+        }
+        .onAppear { viewModel.start() }
+        .onDisappear { viewModel.stop() }
+        .animation(.spring(response: 0.32, dampingFraction: 0.88), value: isMiniMapExpanded)
+    }
 
-            HUDView(
-                inferenceMs: viewModel.inferenceMs,
-                detectionCount: viewModel.detectionCount,
-                orientation: viewModel.orientation
-            )
+    private func miniMap() -> some View {
+        MiniMapView(scene: viewModel.miniMapService.scene)
+            .if(isMiniMapExpanded) { view in
+                view
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea()
+            }
+            .if(!isMiniMapExpanded) { view in
+                view
+                    .frame(width: 180, height: 180)
+                    .aspectRatio(1, contentMode: .fit)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: isMiniMapExpanded ? 0 : 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: isMiniMapExpanded ? 0 : 12)
+                    .stroke(Color.white.opacity(0.85), lineWidth: isMiniMapExpanded ? 0 : 1)
+            }
+            .shadow(color: .black.opacity(0.22), radius: isMiniMapExpanded ? 0 : 18, y: 8)
             .frame(
                 maxWidth: .infinity,
                 maxHeight: .infinity,
-                alignment: viewModel.orientation.isFlipped ? .bottom : .top
+                alignment: isMiniMapExpanded ? .center : .bottomTrailing
             )
-            .padding(.horizontal, 16)
-            .padding(.top, 16)
-            .padding(.bottom, 16)
+            .padding(.trailing, isMiniMapExpanded ? 0 : 16)
+            .padding(.bottom, isMiniMapExpanded ? 0 : 24)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                setMiniMapExpanded(!isMiniMapExpanded)
+            }
+    }
 
-            MiniMapView(scene: viewModel.miniMapService.scene)
-                .frame(width: 180, height: 180)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.white.opacity(0.8), lineWidth: 1)
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                .padding(.trailing, 16)
-                .padding(.bottom, 24)
+    private func setMiniMapExpanded(_ isExpanded: Bool) {
+        isMiniMapExpanded = isExpanded
+        viewModel.setMiniMapPresentationMode(isExpanded ? .expanded : .compact)
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func `if`<Content: View>(_ condition: Bool, transform: (Self) -> Content) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear { viewModel.start() }
-        .onDisappear { viewModel.stop() }
     }
 }

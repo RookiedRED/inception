@@ -176,4 +176,8 @@ final class DriveViewModel: ObservableObject {
             orientation: orientation
         )
     }
+
+    func setMiniMapPresentationMode(_ mode: MiniMapService.PresentationMode) {
+        miniMapService.setPresentationMode(mode)
+    }
 }

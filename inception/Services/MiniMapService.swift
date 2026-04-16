@@ -14,6 +14,11 @@ import UIKit
 @MainActor
 final class MiniMapService {
 
+    enum PresentationMode: Equatable {
+        case compact
+        case expanded
+    }
+
     // MARK: - Public scene
 
     let scene: SCNScene = SCNScene()
@@ -49,6 +54,7 @@ final class MiniMapService {
     private var lastUserPosition = simd_float3.zero
     private var lastYaw: Float = 0
     private var hasSmoothedCameraState = false
+    private var presentationMode: PresentationMode = .compact
 
     // MARK: - Config
 
@@ -162,8 +168,8 @@ final class MiniMapService {
 
     private func setupCamera() {
         let camera = SCNCamera()
-        camera.usesOrthographicProjection = false
-        camera.fieldOfView = 50
+        camera.usesOrthographicProjection = true
+        camera.orthographicScale = 3.4
         camera.zNear = 0.01
         camera.zFar = 100
         camera.wantsHDR = false
@@ -246,6 +252,12 @@ final class MiniMapService {
         }
     }
 
+    func setPresentationMode(_ mode: PresentationMode) {
+        guard presentationMode != mode else { return }
+        presentationMode = mode
+        updateMiniMapCamera()
+    }
+
     func updateMeshAnchors(_ anchors: [ARMeshAnchor]) {
         let currentIds = Set(anchors.map(\.identifier))
         let now = CACurrentMediaTime()
@@ -302,8 +314,17 @@ final class MiniMapService {
 
     /// Fixed 2.5D view, looking at minimap center.
     private func updateMiniMapCamera() {
-        cameraRigNode.position = SCNVector3(0, 2.8, 3.6)
-        cameraNode.look(at: SCNVector3(0, 0.2, 0))
+        switch presentationMode {
+        case .compact:
+            cameraNode.camera?.orthographicScale = 3.4
+            cameraRigNode.position = SCNVector3(0, 2.8, 3.6)
+            cameraNode.look(at: SCNVector3(0, 0.2, 0))
+
+        case .expanded:
+            cameraNode.camera?.orthographicScale = 6.2
+            cameraRigNode.position = SCNVector3(0, 5.2, 6.8)
+            cameraNode.look(at: SCNVector3(0, 0.15, 0))
+        }
     }
 
     /// Only horizontal yaw matters. Ignore pitch/roll completely.

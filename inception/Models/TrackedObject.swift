@@ -8,16 +8,17 @@
 import Foundation
 import simd
 
-/// A detection with a stable track ID maintained across frames.
+/// Lightweight display model used by the overlay and minimap.
+/// In the current detection-only pipeline, IDs are recreated every inference pass.
 struct TrackedObject: Identifiable {
-    let id: Int                         // stable across frames (survives ReID)
-    var detection: Detection            // latest bbox + class info
-    var velocity: SIMD2<Float>          // normalized units per frame
-    var age: Int                        // total frames since created
-    var timeSinceUpdate: Int            // frames since last matched
+    let id: Int
+    var detection: Detection
+    var velocity: SIMD2<Float>
+    var age: Int
+    var timeSinceUpdate: Int
     var visibility: Visibility
-    var depth: Float?                   // meters from camera (LiDAR)
-    var worldPosition: simd_float3?     // 3D world coordinates
+    var depth: Float?
+    var worldPosition: simd_float3?
     var lastSeenTimestamp: TimeInterval
 
     enum Visibility: String {

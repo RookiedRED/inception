@@ -8,37 +8,70 @@
 import SwiftUI
 
 struct DetectionOverlayView: View {
-    let image: UIImage?
     let trackedObjects: [TrackedObject]
     let orientation: AppOrientation
+    let imageResolution: CGSize
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                // 框 + 填色 overlay（拉伸對齊相機畫面）
-                if let image {
-                    Image(uiImage: image)
-                        .resizable()
-                }
-
-                // 文字標籤（SwiftUI 渲染，不會被拉伸）
                 ForEach(trackedObjects) { obj in
-                    let x = obj.detection.bbox.minX * geo.size.width
-                    let y = obj.detection.bbox.minY * geo.size.height
+                    let box = displayRect(
+                        for: obj.detection.bbox,
+                        viewSize: geo.size,
+                        imageResolution: imageResolution
+                    )
 
-                    Text(obj.trackLabel)
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color(obj.detection.color).opacity(
-                            obj.visibility == .visible ? 0.75 : 0.4
-                        ))
-                        .rotationEffect(.degrees(orientation.isFlipped ? 180 : 0))
-                        .position(x: x + 40, y: y + 10)
+                    if !box.isNull && !box.isEmpty {
+                        ZStack(alignment: .topLeading) {
+                            Rectangle()
+                                .stroke(Color(obj.detection.color), lineWidth: 2)
+                                .background(
+                                    Rectangle()
+                                        .fill(Color(obj.detection.color).opacity(0.12))
+                                )
+                                .frame(width: box.width, height: box.height)
+                                .position(x: box.midX, y: box.midY)
+
+                            Text(obj.trackLabel)
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(Color(obj.detection.color).opacity(
+                                    obj.visibility == .visible ? 0.75 : 0.4
+                                ))
+                                .rotationEffect(.degrees(orientation.isFlipped ? 180 : 0))
+                                .position(
+                                    x: min(box.minX + 52, geo.size.width - 52),
+                                    y: max(box.minY + 10, 10)
+                                )
+                        }
+                    }
                 }
             }
         }
         .allowsHitTesting(false)
+    }
+
+    private func displayRect(for bbox: CGRect, viewSize: CGSize, imageResolution: CGSize) -> CGRect {
+        guard imageResolution.width > 0, imageResolution.height > 0 else { return .null }
+
+        // Mirror the preview's aspect-fill math so the vector overlay stays registered.
+        let scale = max(
+            viewSize.width / imageResolution.width,
+            viewSize.height / imageResolution.height
+        )
+        let displayedWidth = imageResolution.width * scale
+        let displayedHeight = imageResolution.height * scale
+        let offsetX = (viewSize.width - displayedWidth) * 0.5
+        let offsetY = (viewSize.height - displayedHeight) * 0.5
+
+        return CGRect(
+            x: offsetX + bbox.minX * displayedWidth,
+            y: offsetY + bbox.minY * displayedHeight,
+            width: bbox.width * displayedWidth,
+            height: bbox.height * displayedHeight
+        ).intersection(CGRect(origin: .zero, size: viewSize))
     }
 }

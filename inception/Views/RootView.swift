@@ -12,10 +12,13 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
+            CameraPreviewView(pixelBuffer: viewModel.cameraPixelBuffer)
+                .ignoresSafeArea()
+
             DetectionOverlayView(
-                image: viewModel.overlay,
                 trackedObjects: viewModel.trackedObjects,
-                orientation: viewModel.orientation
+                orientation: viewModel.orientation,
+                imageResolution: viewModel.imageResolution
             )
             .ignoresSafeArea()
 
@@ -45,9 +48,6 @@ struct RootView: View {
                 .padding(.bottom, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background {
-            CameraPreviewView(image: viewModel.cameraImage)
-        }
         .onAppear { viewModel.start() }
         .onDisappear { viewModel.stop() }
     }

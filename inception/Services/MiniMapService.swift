@@ -48,6 +48,7 @@ final class MiniMapService {
 
     private var lastUserPosition = simd_float3.zero
     private var lastYaw: Float = 0
+    private var hasSmoothedCameraState = false
 
     // MARK: - Config
 
@@ -56,6 +57,8 @@ final class MiniMapService {
     private let horizontalFaceThreshold: Float = 0.88
     private let meshRefreshInterval: TimeInterval = 1.0
     private let maxFacesPerAnchor = 1_500
+    private let positionSmoothingAlpha: Float = 0.18
+    private let yawSmoothingAlpha: Float = 0.14
 
     // MARK: - Init
 
@@ -195,10 +198,16 @@ final class MiniMapService {
         // Your confirmed correct landscape compensation
         let landscapeOffset: Float = .pi
         let flippedOffset: Float = orientation.isFlipped ? .pi : 0
-        let yaw = rawYaw + landscapeOffset + flippedOffset
+        let targetYaw = rawYaw + landscapeOffset + flippedOffset
 
-        lastUserPosition = position
-        lastYaw = yaw
+        if hasSmoothedCameraState {
+            lastUserPosition = simd_mix(lastUserPosition, position, simd_float3(repeating: positionSmoothingAlpha))
+            lastYaw = interpolateAngle(from: lastYaw, to: targetYaw, alpha: yawSmoothingAlpha)
+        } else {
+            lastUserPosition = position
+            lastYaw = targetYaw
+            hasSmoothedCameraState = true
+        }
 
         // User always fixed at minimap center
         userMarkerNode.position = SCNVector3(0, 0.08, 0)
@@ -206,10 +215,10 @@ final class MiniMapService {
         headingNode.eulerAngles = SCNVector3Zero
 
         // Translate world so user is centered
-        translationRootNode.position = SCNVector3(-position.x, 0, -position.z)
+        translationRootNode.position = SCNVector3(-lastUserPosition.x, 0, -lastUserPosition.z)
 
         // Rotate map so minimap top = phone facing direction
-        rotationRootNode.eulerAngles = SCNVector3(0, -yaw, 0)
+        rotationRootNode.eulerAngles = SCNVector3(0, -lastYaw, 0)
 
         updateMiniMapCamera()
     }
@@ -307,6 +316,22 @@ final class MiniMapService {
 
         let normalized = simd_normalize(forward)
         return atan2(normalized.x, normalized.z)
+    }
+
+    private func interpolateAngle(from current: Float, to target: Float, alpha: Float) -> Float {
+        let delta = shortestAngleDelta(from: current, to: target)
+        return normalizeAngle(current + delta * alpha)
+    }
+
+    private func shortestAngleDelta(from current: Float, to target: Float) -> Float {
+        normalizeAngle(target - current)
+    }
+
+    private func normalizeAngle(_ angle: Float) -> Float {
+        var value = angle
+        while value > .pi { value -= 2 * .pi }
+        while value < -.pi { value += 2 * .pi }
+        return value
     }
 
     // MARK: - Object rendering

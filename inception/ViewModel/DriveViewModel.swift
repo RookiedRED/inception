@@ -17,7 +17,6 @@ final class DriveViewModel: ObservableObject {
 
     let cameraService = ARCameraService()
     let inferenceService = InferenceService()
-    let trackingService = TrackingService()
     let miniMapService = MiniMapService()
 
     // MARK: - Session (for non-rendering uses like MiniMap)
@@ -26,20 +25,20 @@ final class DriveViewModel: ObservableObject {
 
     // MARK: - Published UI State
 
-    @Published var cameraImage: UIImage?                     // camera feed (replaces ARSCNView)
-    @Published var overlay: UIImage?
+    @Published var cameraPixelBuffer: CVPixelBuffer?
     @Published var trackedObjects: [TrackedObject] = []
     @Published var inferenceMs: Double = 0
     @Published var detectionCount: Int = 0
     @Published var orientation: AppOrientation = .normal
+    @Published var imageResolution: CGSize = .zero
 
     // MARK: - Internal State
 
     private var subscriptions = Set<AnyCancellable>()
     private var frameCount = 0
-    private let inferenceInterval = 2
     private var isInferring = false
     private var didSetupPipeline = false
+    private var latestCameraTimestamp: TimeInterval = 0
 
     // MARK: - Lifecycle
 
@@ -91,63 +90,47 @@ final class DriveViewModel: ObservableObject {
     // MARK: - Frame Handling
 
     private func handleARFrame(_ pixelBuffer: CVPixelBuffer, context: ARFrameContext) {
-        let dbg = ARCameraService.FrameDebug.shared
         let t0 = CACurrentMediaTime()
 
-        // Generate camera preview image (GPU-accelerated, ~1ms)
-        let cameraImg = ARCameraService.imageFromBuffer(pixelBuffer)
-        let tImg = CACurrentMediaTime()
-        dbg.recordImageTime((tImg - t0) * 1000)
+        // Keep the preview on the freshest frame available, even while inference is busy.
+        Task { @MainActor in
+            guard context.timestamp >= self.latestCameraTimestamp else { return }
+            self.latestCameraTimestamp = context.timestamp
+            self.cameraPixelBuffer = pixelBuffer
+            self.imageResolution = context.imageResolution
+        }
 
         frameCount += 1
-        let shouldInfer = (frameCount % inferenceInterval == 0) && !isInferring
+        let shouldInfer = !isInferring
 
         if shouldInfer {
             isInferring = true
-            let dispatchTime = CACurrentMediaTime()
+            // Release the AR frame gate immediately so camera preview stays responsive
+            // while inference runs on its private queue.
+            cameraService.endProcessing()
 
-            let cameraService = self.cameraService
-            inferenceService.run(pixelBuffer: pixelBuffer) { [weak self, cameraService] result in
+            let dispatchTime = CACurrentMediaTime()
+            inferenceService.run(pixelBuffer: pixelBuffer) { [weak self] result in
                 guard let self else {
-                    print("[FrameDebug] WARNING: self is nil in inference callback, unlocking gate")
                     ARCameraService.FrameDebug.shared.recordCallbackNil()
-                    cameraService.endProcessing()
                     return
                 }
 
-                let callbackTime = CACurrentMediaTime()
-                let inferLatency = (callbackTime - dispatchTime) * 1000
-
+                let inferLatency = (CACurrentMediaTime() - dispatchTime) * 1000
                 defer {
                     self.isInferring = false
-                    self.cameraService.endProcessing()
-                    let totalMs = (CACurrentMediaTime() - dispatchTime) * 1000
-                    print(String(format: "[FrameDebug] INFER: latency=%.1fms total=%.1fms thread=%@",
-                                 inferLatency, totalMs,
-                                 Thread.isMainThread ? "main" : "bg"))
+                    print(String(format: "[FrameDebug] INFER: latency=%.1fms thread=%@",
+                                 inferLatency, Thread.isMainThread ? "main" : "bg"))
                 }
 
                 switch result {
                 case .success(let output):
-                    let objects = self.trackingService.update(
-                        detections: output.detections,
-                        context: context
-                    )
-
-                    let detections = objects.map(\.detection)
-                    let overlay = self.inferenceService.renderOverlay(detections)
-
+                    let objects = self.makeDisplayObjects(from: output.detections, timestamp: context.timestamp)
                     Task { @MainActor in
-                        self.miniMapService.updateCamera(
-                            transform: context.cameraTransform,
-                            orientation: self.orientation
-                        )
-                        self.miniMapService.updateTrackedObjects(objects)
-
-                        self.cameraImage = cameraImg
-                        self.overlay = overlay
-                        self.trackedObjects = objects
+                        self.updateMiniMapCamera(with: context)
                         self.inferenceMs = output.inferenceMs
+                        self.miniMapService.updateTrackedObjects(objects)
+                        self.trackedObjects = objects
                         self.detectionCount = objects.count
                     }
 
@@ -157,38 +140,40 @@ final class DriveViewModel: ObservableObject {
             }
 
         } else {
-            // Tracking-only frame
-            let tTrack0 = CACurrentMediaTime()
-            let objects = trackingService.predict(context: context)
-            let tTrack1 = CACurrentMediaTime()
-
-            let detections = objects.map(\.detection)
-            let overlay = inferenceService.renderOverlay(detections)
-            let tRender = CACurrentMediaTime()
-
             Task { @MainActor in
-                self.miniMapService.updateCamera(
-                    transform: context.cameraTransform,
-                    orientation: self.orientation
-                )
-                self.miniMapService.updateTrackedObjects(objects)
-
-                self.cameraImage = cameraImg
-                self.overlay = overlay
-                self.trackedObjects = objects
-                self.detectionCount = objects.count
+                self.updateMiniMapCamera(with: context)
             }
 
             cameraService.endProcessing()
 
-            let totalMs = (CACurrentMediaTime() - t0) * 1000
-            let trackMs = (tTrack1 - tTrack0) * 1000
-            let renderMs = (tRender - tTrack1) * 1000
             // Only print occasionally to avoid log spam
             if frameCount % 30 == 0 {
-                print(String(format: "[FrameDebug] TRACK: img=%.1fms track=%.1fms render=%.1fms total=%.1fms",
-                             (tImg - t0) * 1000, trackMs, renderMs, totalMs))
+                let totalMs = (CACurrentMediaTime() - t0) * 1000
+                print(String(format: "[FrameDebug] PREVIEW: total=%.1fms", totalMs))
             }
         }
+    }
+
+    private func makeDisplayObjects(from detections: [Detection], timestamp: TimeInterval) -> [TrackedObject] {
+        detections.enumerated().map { index, detection in
+            TrackedObject(
+                id: index,
+                detection: detection,
+                velocity: .zero,
+                age: 1,
+                timeSinceUpdate: 0,
+                visibility: .visible,
+                depth: nil,
+                worldPosition: nil,
+                lastSeenTimestamp: timestamp
+            )
+        }
+    }
+
+    private func updateMiniMapCamera(with context: ARFrameContext) {
+        miniMapService.updateCamera(
+            transform: context.cameraTransform,
+            orientation: orientation
+        )
     }
 }

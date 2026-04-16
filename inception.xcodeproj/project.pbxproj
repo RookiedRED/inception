@@ -8,11 +8,17 @@
 
 /* Begin PBXBuildFile section */
 		612E1D252F8EDE9B00F8E603 /* yolov8n-seg.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 612E1D242F8EDE9B00F8E603 /* yolov8n-seg.mlpackage */; };
+		612E1D282F8F439600F8E603 /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = 612E1D272F8F439600F8E603 /* onnxruntime */; };
+		612E1D2A2F8F439600F8E603 /* onnxruntime_extensions in Frameworks */ = {isa = PBXBuildFile; productRef = 612E1D292F8F439600F8E603 /* onnxruntime_extensions */; };
+		612E1D462F90877100F8E603 /* yolo26n.onnx in Resources */ = {isa = PBXBuildFile; fileRef = 612E1D452F90877100F8E603 /* yolo26n.onnx */; };
+		612E1D4A2F90A27E00F8E603 /* yolo26n.ort in Resources */ = {isa = PBXBuildFile; fileRef = 612E1D492F90A27E00F8E603 /* yolo26n.ort */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		612E1CE92F8EDE5000F8E603 /* inception.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = inception.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		612E1D242F8EDE9B00F8E603 /* yolov8n-seg.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = "yolov8n-seg.mlpackage"; sourceTree = "<group>"; };
+		612E1D452F90877100F8E603 /* yolo26n.onnx */ = {isa = PBXFileReference; lastKnownFileType = file; path = yolo26n.onnx; sourceTree = "<group>"; };
+		612E1D492F90A27E00F8E603 /* yolo26n.ort */ = {isa = PBXFileReference; lastKnownFileType = file; path = yolo26n.ort; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -28,6 +34,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				612E1D2A2F8F439600F8E603 /* onnxruntime_extensions in Frameworks */,
+				612E1D282F8F439600F8E603 /* onnxruntime in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -40,6 +48,8 @@
 				612E1CEB2F8EDE5000F8E603 /* inception */,
 				612E1CEA2F8EDE5000F8E603 /* Products */,
 				612E1D242F8EDE9B00F8E603 /* yolov8n-seg.mlpackage */,
+				612E1D452F90877100F8E603 /* yolo26n.onnx */,
+				612E1D492F90A27E00F8E603 /* yolo26n.ort */,
 			);
 			sourceTree = "<group>";
 		};
@@ -71,6 +81,8 @@
 			);
 			name = inception;
 			packageProductDependencies = (
+				612E1D272F8F439600F8E603 /* onnxruntime */,
+				612E1D292F8F439600F8E603 /* onnxruntime_extensions */,
 			);
 			productName = inception;
 			productReference = 612E1CE92F8EDE5000F8E603 /* inception.app */;
@@ -100,6 +112,9 @@
 			);
 			mainGroup = 612E1CE02F8EDE5000F8E603;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				612E1D262F8F439600F8E603 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 612E1CEA2F8EDE5000F8E603 /* Products */;
 			projectDirPath = "";
@@ -115,6 +130,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				612E1D462F90877100F8E603 /* yolo26n.onnx in Resources */,
+				612E1D4A2F90A27E00F8E603 /* yolo26n.ort in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -341,6 +358,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		612E1D262F8F439600F8E603 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/microsoft/onnxruntime-swift-package-manager";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.24.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		612E1D272F8F439600F8E603 /* onnxruntime */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 612E1D262F8F439600F8E603 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
+			productName = onnxruntime;
+		};
+		612E1D292F8F439600F8E603 /* onnxruntime_extensions */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 612E1D262F8F439600F8E603 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
+			productName = onnxruntime_extensions;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 612E1CE12F8EDE5000F8E603 /* Project object */;
 }

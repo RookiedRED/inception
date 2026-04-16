@@ -24,7 +24,7 @@ struct HUDView: View {
     private var cpuLabel: some View {
         HUDLabel(
             icon: "cpu",
-            text: String(format: "%.0f ms", inferenceMs),
+            text: String(format: "%.1f ms", inferenceMs),
             color: inferenceMs < 100 ? .green : .orange
         )
     }

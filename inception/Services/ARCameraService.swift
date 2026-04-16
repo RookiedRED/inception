@@ -6,7 +6,6 @@
 import ARKit
 import Combine
 import CoreVideo
-import CoreImage
 import QuartzCore
 
 final class ARCameraService: NSObject {
@@ -61,7 +60,6 @@ final class ARCameraService: NSObject {
         private var lastGateHeld: CFTimeInterval = 0
         private var maxGateHeld: CFTimeInterval = 0
         private var totalCopyMs: Double = 0
-        private var totalImageMs: Double = 0
 
         func recordDelegateCall() {
             lock.lock()
@@ -99,12 +97,6 @@ final class ARCameraService: NSObject {
             lock.unlock()
         }
 
-        func recordImageTime(_ ms: Double) {
-            lock.lock()
-            totalImageMs += ms
-            lock.unlock()
-        }
-
         func recordGateHeld(_ seconds: CFTimeInterval) {
             lock.lock()
             lastGateHeld = seconds
@@ -123,12 +115,11 @@ final class ARCameraService: NSObject {
             let d = delegateCalls, g = gateDrops, a = accepted, cf = copyFails, cn = callbackNil
             let gh = lastGateHeld, mgh = maxGateHeld
             let avgCopy = a > 0 ? totalCopyMs / Double(a) : 0
-            let avgImg = a > 0 ? totalImageMs / Double(a) : 0
 
             // reset
             delegateCalls = 0; gateDrops = 0; accepted = 0
             copyFails = 0; callbackNil = 0
-            totalCopyMs = 0; totalImageMs = 0; maxGateHeld = 0
+            totalCopyMs = 0; maxGateHeld = 0
             lastReportTime = now
             lock.unlock()
 
@@ -137,20 +128,9 @@ final class ARCameraService: NSObject {
             [FrameDebug] 2s window | thread=\(thread)
               delegate=\(d) gateDrop=\(g) accepted=\(a) copyFail=\(cf) callbackNil=\(cn)
               lastGateHeld=\(String(format: "%.1fms", gh*1000)) maxGateHeld=\(String(format: "%.1fms", mgh*1000))
-              avgCopy=\(String(format: "%.1fms", avgCopy)) avgImage=\(String(format: "%.1fms", avgImg))
+              avgCopy=\(String(format: "%.1fms", avgCopy))
             """)
         }
-    }
-
-    // MARK: - Camera image conversion
-
-    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-
-    /// Convert a pixel buffer to UIImage (GPU-accelerated via CIContext).
-    static func imageFromBuffer(_ buffer: CVPixelBuffer) -> UIImage? {
-        let ciImage = CIImage(cvPixelBuffer: buffer)
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return nil }
-        return UIImage(cgImage: cgImage)
     }
 
     // MARK: - Private state

@@ -9,6 +9,7 @@ import SwiftUI
 import ARKit
 import UIKit
 import CoreVideo
+import simd
 
 @MainActor
 final class DriveViewModel: ObservableObject {
@@ -125,7 +126,11 @@ final class DriveViewModel: ObservableObject {
 
                 switch result {
                 case .success(let output):
-                    let objects = self.makeDisplayObjects(from: output.detections, timestamp: context.timestamp)
+                    let objects = self.makeDisplayObjects(
+                        from: output.detections,
+                        context: context,
+                        timestamp: context.timestamp
+                    )
                     Task { @MainActor in
                         self.updateMiniMapCamera(with: context)
                         self.inferenceMs = output.inferenceMs
@@ -154,20 +159,94 @@ final class DriveViewModel: ObservableObject {
         }
     }
 
-    private func makeDisplayObjects(from detections: [Detection], timestamp: TimeInterval) -> [TrackedObject] {
+    private func makeDisplayObjects(
+        from detections: [Detection],
+        context: ARFrameContext,
+        timestamp: TimeInterval
+    ) -> [TrackedObject] {
         detections.enumerated().map { index, detection in
-            TrackedObject(
+            let objectEstimate = estimateWorldPosition(for: detection, context: context)
+            return TrackedObject(
                 id: index,
                 detection: detection,
                 velocity: .zero,
                 age: 1,
                 timeSinceUpdate: 0,
                 visibility: .visible,
-                depth: nil,
-                worldPosition: nil,
+                depth: objectEstimate.depth,
+                worldPosition: objectEstimate.worldPosition,
                 lastSeenTimestamp: timestamp
             )
         }
+    }
+
+    private func estimateWorldPosition(
+        for detection: Detection,
+        context: ARFrameContext
+    ) -> (worldPosition: simd_float3?, depth: Float?) {
+        guard let sceneDepth = context.sceneDepth else {
+            return (nil, nil)
+        }
+
+        let imageResolution = context.imageResolution
+        let depthResolution = sceneDepth.resolution
+        guard imageResolution.width > 0,
+              imageResolution.height > 0,
+              depthResolution.width > 0,
+              depthResolution.height > 0 else {
+            return (nil, nil)
+        }
+
+        let bbox = detection.bbox
+        let imagePoint = CGPoint(
+            x: (bbox.midX * imageResolution.width).clamped(to: 0...imageResolution.width),
+            y: ((bbox.maxY - 0.02) * imageResolution.height).clamped(to: 0...imageResolution.height)
+        )
+        let depthPoint = CGPoint(
+            x: imagePoint.x * depthResolution.width / imageResolution.width,
+            y: imagePoint.y * depthResolution.height / imageResolution.height
+        )
+
+        guard let sampledDepth = sampledDepth(around: depthPoint, sceneDepth: sceneDepth) else {
+            return (nil, nil)
+        }
+
+        let fx = sceneDepth.intrinsics.columns.0.x
+        let fy = sceneDepth.intrinsics.columns.1.y
+        let cx = sceneDepth.intrinsics.columns.2.x
+        let cy = sceneDepth.intrinsics.columns.2.y
+        guard fx > 0, fy > 0 else {
+            return (nil, sampledDepth)
+        }
+
+        let cameraX = (Float(depthPoint.x) - cx) * sampledDepth / fx
+        let cameraY = (Float(depthPoint.y) - cy) * sampledDepth / fy
+        let cameraSpacePoint = simd_float4(cameraX, cameraY, -sampledDepth, 1)
+        let worldPoint = context.cameraTransform * cameraSpacePoint
+
+        return (simd_float3(worldPoint.x, worldPoint.y, worldPoint.z), sampledDepth)
+    }
+
+    private func sampledDepth(
+        around point: CGPoint,
+        sceneDepth: ARFrameContext.SceneDepthData
+    ) -> Float? {
+        let centerX = Int(point.x.rounded())
+        let centerY = Int(point.y.rounded())
+        var candidates: [Float] = []
+        candidates.reserveCapacity(25)
+
+        for offsetY in -2...2 {
+            for offsetX in -2...2 {
+                if let depth = sceneDepth.depthAt(x: centerX + offsetX, y: centerY + offsetY) {
+                    candidates.append(depth)
+                }
+            }
+        }
+
+        guard !candidates.isEmpty else { return nil }
+        candidates.sort()
+        return candidates[candidates.count / 2]
     }
 
     private func updateMiniMapCamera(with context: ARFrameContext) {
@@ -179,5 +258,19 @@ final class DriveViewModel: ObservableObject {
 
     func setMiniMapPresentationMode(_ mode: MiniMapService.PresentationMode) {
         miniMapService.setPresentationMode(mode)
+    }
+
+    func setMiniMapZoomScale(_ scale: Double) {
+        miniMapService.setExpandedZoomScale(scale)
+    }
+
+    func panExpandedMiniMap(by translation: CGPoint, viewportSize: CGSize) {
+        miniMapService.panExpandedMap(byScreenTranslation: translation, viewportSize: viewportSize)
+    }
+}
+
+private extension Comparable {
+    func clamped(to range: ClosedRange<Self>) -> Self {
+        min(max(self, range.lowerBound), range.upperBound)
     }
 }

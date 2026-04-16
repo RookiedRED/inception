@@ -7,6 +7,7 @@ import ARKit
 import Combine
 import CoreVideo
 import QuartzCore
+import simd
 
 final class ARCameraService: NSObject {
 
@@ -232,6 +233,51 @@ final class ARCameraService: NSObject {
         lastMeshPublishTime = timestamp
         meshAnchorPublisher.send(Array(currentMeshAnchors.values))
     }
+
+    private static func copySceneDepth(from frame: ARFrame) -> ARFrameContext.SceneDepthData? {
+        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
+            return nil
+        }
+
+        let depthMap = depthData.depthMap
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
+            return nil
+        }
+
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        let rowBytes = CVPixelBufferGetBytesPerRow(depthMap)
+        let floatsPerRow = rowBytes / MemoryLayout<Float32>.stride
+        let source = baseAddress.assumingMemoryBound(to: Float32.self)
+
+        var copiedValues = [Float32](repeating: 0, count: width * height)
+        copiedValues.withUnsafeMutableBufferPointer { buffer in
+            guard let destination = buffer.baseAddress else { return }
+            for row in 0..<height {
+                let srcRow = source.advanced(by: row * floatsPerRow)
+                let dstRow = destination.advanced(by: row * width)
+                dstRow.update(from: srcRow, count: width)
+            }
+        }
+
+        let imageResolution = frame.camera.imageResolution
+        let scaleX = Float(width) / Float(imageResolution.width)
+        let scaleY = Float(height) / Float(imageResolution.height)
+        var depthIntrinsics = frame.camera.intrinsics
+        depthIntrinsics.columns.0.x *= scaleX
+        depthIntrinsics.columns.1.y *= scaleY
+        depthIntrinsics.columns.2.x *= scaleX
+        depthIntrinsics.columns.2.y *= scaleY
+
+        return ARFrameContext.SceneDepthData(
+            values: copiedValues,
+            resolution: CGSize(width: width, height: height),
+            intrinsics: depthIntrinsics
+        )
+    }
 }
 
 // MARK: - ARSessionDelegate
@@ -259,6 +305,7 @@ extension ARCameraService: ARSessionDelegate {
                 width: CVPixelBufferGetWidth(frame.capturedImage),
                 height: CVPixelBufferGetHeight(frame.capturedImage)
             ),
+            sceneDepth: Self.copySceneDepth(from: frame),
             timestamp: frame.timestamp
         )
 

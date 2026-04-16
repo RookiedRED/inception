@@ -25,6 +25,9 @@ final class MiniMapService {
 
     // MARK: - Scene graph
 
+    /// Screen-space pan root used only for expanded minimap navigation.
+    private let panRootNode = SCNNode()
+
     /// Rotation root: rotates map with phone yaw
     private let rotationRootNode = SCNNode()
 
@@ -55,6 +58,8 @@ final class MiniMapService {
     private var lastYaw: Float = 0
     private var hasSmoothedCameraState = false
     private var presentationMode: PresentationMode = .compact
+    private var expandedZoomScale: Double = 1.0
+    private var expandedPanOffset = SIMD2<Float>(repeating: 0)
 
     // MARK: - Config
 
@@ -65,11 +70,16 @@ final class MiniMapService {
     private let maxFacesPerAnchor = 1_500
     private let positionSmoothingAlpha: Float = 0.18
     private let yawSmoothingAlpha: Float = 0.14
+    private let compactOrthographicScale: Double = 3.4
+    private let expandedOrthographicScale: Double = 6.2
+    private let minimumExpandedZoomScale: Double = 0.55
+    private let maximumExpandedZoomScale: Double = 2.4
 
     // MARK: - Init
 
     init() {
-        scene.rootNode.addChildNode(rotationRootNode)
+        scene.rootNode.addChildNode(panRootNode)
+        panRootNode.addChildNode(rotationRootNode)
         rotationRootNode.addChildNode(translationRootNode)
 
         translationRootNode.addChildNode(environmentRootNode)
@@ -235,7 +245,14 @@ final class MiniMapService {
         for object in objects {
             guard let world = object.worldPosition else { continue }
 
-            let node = objectNodes[object.id] ?? makeObjectNode(for: object)
+            let node: SCNNode
+            if let existingNode = objectNodes[object.id],
+               existingNode.name == object.detection.className {
+                node = existingNode
+            } else {
+                objectNodes[object.id]?.removeFromParentNode()
+                node = makeObjectNode(for: object)
+            }
             objectNodes[object.id] = node
 
             // Keep object in world coordinates; relative transform is handled by root nodes
@@ -255,6 +272,33 @@ final class MiniMapService {
     func setPresentationMode(_ mode: PresentationMode) {
         guard presentationMode != mode else { return }
         presentationMode = mode
+        if mode == .compact {
+            expandedPanOffset = .zero
+        }
+        updateMiniMapCamera()
+    }
+
+    func setExpandedZoomScale(_ scale: Double) {
+        let clampedScale = min(max(scale, minimumExpandedZoomScale), maximumExpandedZoomScale)
+        guard abs(clampedScale - expandedZoomScale) > 0.001 else { return }
+        expandedZoomScale = clampedScale
+
+        guard presentationMode == .expanded else { return }
+        updateMiniMapCamera()
+    }
+
+    func panExpandedMap(byScreenTranslation translation: CGPoint, viewportSize: CGSize) {
+        guard presentationMode == .expanded else { return }
+        guard viewportSize.width > 0, viewportSize.height > 0 else { return }
+
+        let visibleHeight = Float((expandedOrthographicScale / expandedZoomScale) * 2)
+        let visibleWidth = visibleHeight * Float(viewportSize.width / viewportSize.height)
+
+        let worldDeltaX = Float(translation.x / viewportSize.width) * visibleWidth
+        let worldDeltaZ = Float(translation.y / viewportSize.height) * visibleHeight
+
+        expandedPanOffset.x += worldDeltaX
+        expandedPanOffset.y += worldDeltaZ
         updateMiniMapCamera()
     }
 
@@ -316,14 +360,16 @@ final class MiniMapService {
     private func updateMiniMapCamera() {
         switch presentationMode {
         case .compact:
-            cameraNode.camera?.orthographicScale = 3.4
+            cameraNode.camera?.orthographicScale = compactOrthographicScale
             cameraRigNode.position = SCNVector3(0, 2.8, 3.6)
             cameraNode.look(at: SCNVector3(0, 0.2, 0))
+            panRootNode.position = SCNVector3Zero
 
         case .expanded:
-            cameraNode.camera?.orthographicScale = 6.2
+            cameraNode.camera?.orthographicScale = expandedOrthographicScale / expandedZoomScale
             cameraRigNode.position = SCNVector3(0, 5.2, 6.8)
             cameraNode.look(at: SCNVector3(0, 0.15, 0))
+            panRootNode.position = SCNVector3(expandedPanOffset.x, 0, expandedPanOffset.y)
         }
     }
 
@@ -359,6 +405,7 @@ final class MiniMapService {
 
     private func makeObjectNode(for object: TrackedObject) -> SCNNode {
         let node = SCNNode()
+        node.name = object.detection.className
         let accentColor = accentColor(for: object.detection.className)
 
         let base = SCNCylinder(radius: 0.12, height: 0.03)

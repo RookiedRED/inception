@@ -47,7 +47,16 @@ struct RootView: View {
     }
 
     private func miniMap() -> some View {
-        MiniMapView(scene: viewModel.miniMapService.scene)
+        MiniMapView(
+            scene: viewModel.miniMapService.scene,
+            isZoomEnabled: isMiniMapExpanded,
+            onZoomChanged: { scale in
+                viewModel.setMiniMapZoomScale(scale)
+            },
+            onPanChanged: { translation, viewportSize in
+                viewModel.panExpandedMiniMap(by: translation, viewportSize: viewportSize)
+            }
+        )
             .if(isMiniMapExpanded) { view in
                 view
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -73,7 +82,9 @@ struct RootView: View {
             .padding(.bottom, isMiniMapExpanded ? 0 : 24)
             .contentShape(Rectangle())
             .onTapGesture {
-                setMiniMapExpanded(!isMiniMapExpanded)
+                if !isMiniMapExpanded {
+                    setMiniMapExpanded(true)
+                }
             }
     }
 

@@ -41,7 +41,20 @@ final class DriveViewModel: ObservableObject {
     private var didSetupPipeline = false
     private var latestCameraTimestamp: TimeInterval = 0
     private var latestTrackedObjectsTimestamp: TimeInterval = 0
-    private let objectProcessingQueue = DispatchQueue(label: "com.idrivebot.minimap.objects", qos: .userInitiated)
+    private var lastInferenceTime: CFTimeInterval = 0
+    /// EWMA of recent inference latency (ms). Seed at 100ms as a safe starting estimate.
+    private var ewmaInferenceMs: Double = 100.0
+    private let ewmaAlpha: Double = 0.15  // smoothing factor; lower = more stable
+
+    /// Adaptive minimum interval targeting 65% Neural Engine duty cycle.
+    /// If inference is fast (70ms) → ~108ms interval (≈9fps).
+    /// If throttled (200ms) → ~308ms interval (≈3fps) — backs off automatically.
+    private var adaptiveMinInterval: CFTimeInterval {
+        let targetMs = ewmaInferenceMs / 0.65
+        // Clamp between 6fps (heavy scene) and 15fps (fast device)
+        return max(1.0 / 15.0, min(1.0 / 6.0, targetMs / 1000.0))
+    }
+
 
     // MARK: - Lifecycle
 
@@ -105,10 +118,12 @@ final class DriveViewModel: ObservableObject {
         }
 
         frameCount += 1
-        let shouldInfer = !isInferring
+        let now = CACurrentMediaTime()
+        let shouldInfer = !isInferring && (now - lastInferenceTime >= adaptiveMinInterval)
 
         if shouldInfer {
             isInferring = true
+            lastInferenceTime = now
             // Release the AR frame gate immediately so camera preview stays responsive
             // while inference runs on its private queue.
             cameraService.endProcessing()
@@ -129,26 +144,23 @@ final class DriveViewModel: ObservableObject {
 
                 switch result {
                 case .success(let output):
-                    let detections = output.detections
-                    let inferenceMs = output.inferenceMs
-                    self.objectProcessingQueue.async {
-                        let objects = Self.makeDisplayObjects(
-                            from: detections,
-                            context: context,
-                            timestamp: context.timestamp
-                        )
+                    // Update EWMA so adaptiveMinInterval adjusts on next frame.
+                    self.ewmaInferenceMs = self.ewmaAlpha * output.inferenceMs
+                        + (1.0 - self.ewmaAlpha) * self.ewmaInferenceMs
 
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            guard context.timestamp >= self.latestTrackedObjectsTimestamp else { return }
-
-                            self.latestTrackedObjectsTimestamp = context.timestamp
-                            self.inferenceMs = inferenceMs
-                            self.miniMapService.updateTrackedObjects(objects)
-                            self.trackedObjects = objects
-                            self.detectionCount = objects.count
-                        }
-                    }
+                    // Completion already runs on main thread — compute objects here directly.
+                    // makeDisplayObjects is O(detections) with depth lookups, typically <1ms.
+                    let objects = Self.makeDisplayObjects(
+                        from: output.detections,
+                        context: context,
+                        timestamp: context.timestamp
+                    )
+                    guard context.timestamp >= self.latestTrackedObjectsTimestamp else { return }
+                    self.latestTrackedObjectsTimestamp = context.timestamp
+                    self.inferenceMs = output.inferenceMs
+                    self.miniMapService.updateTrackedObjects(objects)
+                    self.trackedObjects = objects
+                    self.detectionCount = objects.count
 
                 case .failure(let error):
                     print("[FrameDebug] Inference FAILED: \(error)")
@@ -242,6 +254,13 @@ final class DriveViewModel: ObservableObject {
         let centerY = Int(point.y.rounded())
         let width = Int(sceneDepth.resolution.width)
         let height = Int(sceneDepth.resolution.height)
+
+        CVPixelBufferLockBaseAddress(sceneDepth.depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(sceneDepth.depthMap, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(sceneDepth.depthMap) else { return nil }
+        let floatsPerRow = CVPixelBufferGetBytesPerRow(sceneDepth.depthMap) / MemoryLayout<Float32>.stride
+        let ptr = base.assumingMemoryBound(to: Float32.self)
+
         var candidates: [Float] = []
         candidates.reserveCapacity(25)
 
@@ -250,8 +269,7 @@ final class DriveViewModel: ObservableObject {
                 let sampleX = centerX + offsetX
                 let sampleY = centerY + offsetY
                 guard sampleX >= 0, sampleX < width, sampleY >= 0, sampleY < height else { continue }
-
-                let depth = sceneDepth.values[sampleY * width + sampleX]
+                let depth = ptr[sampleY * floatsPerRow + sampleX]
                 guard depth.isFinite, depth > 0 else { continue }
                 candidates.append(depth)
             }

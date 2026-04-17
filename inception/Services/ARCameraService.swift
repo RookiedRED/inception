@@ -234,34 +234,16 @@ final class ARCameraService: NSObject {
         meshAnchorPublisher.send(Array(currentMeshAnchors.values))
     }
 
+    /// Extracts scene depth metadata without copying the depth map pixel data.
+    /// CVPixelBuffer has independent ref-counting — retaining it does NOT retain ARFrame.
     private static func copySceneDepth(from frame: ARFrame) -> ARFrameContext.SceneDepthData? {
         guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
             return nil
         }
 
         let depthMap = depthData.depthMap
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-
-        guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
-            return nil
-        }
-
         let width = CVPixelBufferGetWidth(depthMap)
         let height = CVPixelBufferGetHeight(depthMap)
-        let rowBytes = CVPixelBufferGetBytesPerRow(depthMap)
-        let floatsPerRow = rowBytes / MemoryLayout<Float32>.stride
-        let source = baseAddress.assumingMemoryBound(to: Float32.self)
-
-        var copiedValues = [Float32](repeating: 0, count: width * height)
-        copiedValues.withUnsafeMutableBufferPointer { buffer in
-            guard let destination = buffer.baseAddress else { return }
-            for row in 0..<height {
-                let srcRow = source.advanced(by: row * floatsPerRow)
-                let dstRow = destination.advanced(by: row * width)
-                dstRow.update(from: srcRow, count: width)
-            }
-        }
 
         let imageResolution = frame.camera.imageResolution
         let scaleX = Float(width) / Float(imageResolution.width)
@@ -273,7 +255,7 @@ final class ARCameraService: NSObject {
         depthIntrinsics.columns.2.y *= scaleY
 
         return ARFrameContext.SceneDepthData(
-            values: copiedValues,
+            depthMap: depthMap,
             resolution: CGSize(width: width, height: height),
             intrinsics: depthIntrinsics
         )

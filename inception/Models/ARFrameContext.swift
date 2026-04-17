@@ -8,23 +8,28 @@
 import Foundation
 import simd
 import CoreGraphics
+import CoreVideo
 
 /// Lightweight metadata extracted from an ARFrame.
 /// Important:
-/// - Do NOT store ARFrame itself here
+/// - Do NOT store ARFrame itself here (CVPixelBuffer is fine — it has its own ref-count)
 struct ARFrameContext {
-    struct SceneDepthData {
-        let values: [Float32]
+    struct SceneDepthData: @unchecked Sendable {
+        /// Direct reference to ARKit's depth CVPixelBuffer — zero copy.
+        /// Thread-safety is provided by CVPixelBufferLock/Unlock at each access site.
+        let depthMap: CVPixelBuffer
         let resolution: CGSize
         let intrinsics: simd_float3x3
 
         func depthAt(x: Int, y: Int) -> Float32? {
             let width = Int(resolution.width)
             let height = Int(resolution.height)
-            guard width > 0, height > 0 else { return nil }
-            guard x >= 0, x < width, y >= 0, y < height else { return nil }
-
-            let depth = values[y * width + x]
+            guard width > 0, height > 0, x >= 0, x < width, y >= 0, y < height else { return nil }
+            CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+            guard let base = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+            let floatsPerRow = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.stride
+            let depth = base.assumingMemoryBound(to: Float32.self)[y * floatsPerRow + x]
             guard depth.isFinite, depth > 0 else { return nil }
             return depth
         }

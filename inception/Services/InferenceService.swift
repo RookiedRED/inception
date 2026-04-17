@@ -41,7 +41,12 @@ final class InferenceService {
 
     private let queue = DispatchQueue(label: "inference.service.queue", qos: .userInitiated)
     private let setupQueue = DispatchQueue(label: "inference.service.setup", qos: .userInitiated)
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    // Device RGB skips sRGB↔linear conversion — color accuracy is irrelevant for ML preprocessing.
+    private let ciContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
+        .outputColorSpace: CGColorSpaceCreateDeviceRGB()
+    ])
 
     // MARK: - State
 
@@ -56,8 +61,15 @@ final class InferenceService {
     private var gBytes = [UInt8]()
     private var bBytes = [UInt8]()
 
-    private var inputFloats = [Float32]()
+    // Single buffer — vDSP writes directly here, no intermediate inputFloats copy.
     private var inputMutableData = NSMutableData()
+
+    // Pre-allocated input ORTValue — wraps inputMutableData by reference, reused every frame.
+    private var inputTensor: ORTValue?
+
+    // Cache the letterbox transform — recomputed only when source resolution changes.
+    private var cachedSourceSize: CGSize = .zero
+    private var cachedMapping: PreprocessMapping?
 
     // MARK: - Init
 
@@ -100,17 +112,12 @@ final class InferenceService {
                 }
 
                 do {
-                    let inputShape: [NSNumber] = [
-                        1, 3,
-                        NSNumber(value: self.inputSize),
-                        NSNumber(value: self.inputSize)
-                    ]
-
-                    let inputTensor = try ORTValue(
-                        tensorData: self.inputMutableData,
-                        elementType: .float,
-                        shape: inputShape
-                    )
+                    guard let inputTensor = self.inputTensor else {
+                        DispatchQueue.main.async {
+                            completion(.success(InferenceResult(detections: [], inferenceMs: 0)))
+                        }
+                        return
+                    }
 
                     let outputs = try session.run(
                         withInputs: [self.inputName: inputTensor],
@@ -135,9 +142,11 @@ final class InferenceService {
                         print("📐 \(self.outputName) shape: \(shape)")
                     }
 
+                    // tensorData() returns NSMutableData backed by ORT's raw pointer (no copy).
+                    // We pass it directly to avoid the NSMutableData→Data bridging copy.
                     let outputTensorData = try outputValue.tensorData()
                     let detections = self.parseDetections(
-                        fromTensorBytes: outputTensorData as Data,
+                        fromTensorData: outputTensorData,
                         shape: shape,
                         mapping: mapping
                     )
@@ -176,8 +185,12 @@ final class InferenceService {
         gBytes = [UInt8](repeating: 0, count: planeSize)
         bBytes = [UInt8](repeating: 0, count: planeSize)
 
-        inputFloats = [Float32](repeating: 0, count: 3 * planeSize)
-        inputMutableData = NSMutableData(length: inputFloats.count * MemoryLayout<Float32>.stride) ?? NSMutableData()
+        inputMutableData = NSMutableData(length: 3 * planeSize * MemoryLayout<Float32>.stride) ?? NSMutableData()
+
+        // Create ORTValue once — ORT holds a raw pointer to inputMutableData.mutableBytes,
+        // so in-place writes to the buffer are visible at inference time without re-creation.
+        let inputShape: [NSNumber] = [1, 3, NSNumber(value: inputSize), NSNumber(value: inputSize)]
+        inputTensor = try? ORTValue(tensorData: inputMutableData, elementType: .float, shape: inputShape)
 
         resizedPixelBuffer = Self.makePixelBuffer(width: inputSize, height: inputSize)
     }
@@ -197,8 +210,13 @@ final class InferenceService {
             // CoreML 下不一定 thread 越多越好，先從 2 開始測
             try options.setIntraOpNumThreads(2)
 
-            // 使用 CoreML EP，若裝置/模型不適合會有 fallback
-            try options.appendExecutionProvider("CoreML", providerOptions: [:])
+            // CoreML EP V2：
+            //   CPUAndNeuralEngine — 避免 GPU 參與，降低熱量；ANE 是 neural net 最省電的路徑
+            //   MLProgram — 新版 CoreML 格式，比 NeuralNetwork 有更好的 op 支援與 cache
+            try options.appendCoreMLExecutionProvider(withOptionsV2: [
+                "MLComputeUnits": "CPUAndNeuralEngine",
+                "ModelFormat": "MLProgram"
+            ])
 
             let s = try ORTSession(env: env, modelPath: modelPath, sessionOptions: options)
             session = s
@@ -252,15 +270,28 @@ final class InferenceService {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let sourceWidth = ciImage.extent.width
         let sourceHeight = ciImage.extent.height
-        let scale = min(CGFloat(size) / sourceWidth, CGFloat(size) / sourceHeight)
-        let scaledWidth = sourceWidth * scale
-        let scaledHeight = sourceHeight * scale
-        let offsetX = (CGFloat(size) - scaledWidth) * 0.5
-        let offsetY = (CGFloat(size) - scaledHeight) * 0.5
+
+        // Recompute letterbox transform only when source resolution changes (e.g. orientation flip).
+        let sourceSize = CGSize(width: sourceWidth, height: sourceHeight)
+        let mapping: PreprocessMapping
+        if sourceSize == cachedSourceSize, let cached = cachedMapping {
+            mapping = cached
+        } else {
+            let scale = min(CGFloat(size) / sourceWidth, CGFloat(size) / sourceHeight)
+            let scaledWidth = sourceWidth * scale
+            let scaledHeight = sourceHeight * scale
+            let offsetX = (CGFloat(size) - scaledWidth) * 0.5
+            let offsetY = (CGFloat(size) - scaledHeight) * 0.5
+            let newMapping = PreprocessMapping(sourceWidth: sourceWidth, sourceHeight: sourceHeight,
+                                               scale: scale, offsetX: offsetX, offsetY: offsetY)
+            cachedMapping = newMapping
+            cachedSourceSize = sourceSize
+            mapping = newMapping
+        }
 
         let transformedImage = ciImage.transformed(
-            by: CGAffineTransform(scaleX: scale, y: scale)
-                .concatenating(CGAffineTransform(translationX: offsetX, y: offsetY))
+            by: CGAffineTransform(scaleX: mapping.scale, y: mapping.scale)
+                .concatenating(CGAffineTransform(translationX: mapping.offsetX, y: mapping.offsetY))
         )
         let background = CIImage(color: .black).cropped(to: CGRect(x: 0, y: 0, width: size, height: size))
         let letterboxed = transformedImage.composited(over: background)
@@ -310,47 +341,32 @@ final class InferenceService {
             }
         }
 
+        // Write float data directly into inputMutableData — no intermediate copy.
         var normalizationScale: Float = 1.0 / 255.0
+        let dst = inputMutableData.mutableBytes.assumingMemoryBound(to: Float32.self)
 
-        inputFloats.withUnsafeMutableBufferPointer { ptr in
-            let dst = ptr.baseAddress!
+        vDSP_vfltu8(rBytes, 1, dst + 0 * planeSize, 1, vDSP_Length(planeSize))
+        vDSP_vsmul(dst + 0 * planeSize, 1, &normalizationScale, dst + 0 * planeSize, 1, vDSP_Length(planeSize))
 
-            vDSP_vfltu8(rBytes, 1, dst + 0 * planeSize, 1, vDSP_Length(planeSize))
-            vDSP_vsmul(dst + 0 * planeSize, 1, &normalizationScale, dst + 0 * planeSize, 1, vDSP_Length(planeSize))
+        vDSP_vfltu8(gBytes, 1, dst + 1 * planeSize, 1, vDSP_Length(planeSize))
+        vDSP_vsmul(dst + 1 * planeSize, 1, &normalizationScale, dst + 1 * planeSize, 1, vDSP_Length(planeSize))
 
-            vDSP_vfltu8(gBytes, 1, dst + 1 * planeSize, 1, vDSP_Length(planeSize))
-            vDSP_vsmul(dst + 1 * planeSize, 1, &normalizationScale, dst + 1 * planeSize, 1, vDSP_Length(planeSize))
+        vDSP_vfltu8(bBytes, 1, dst + 2 * planeSize, 1, vDSP_Length(planeSize))
+        vDSP_vsmul(dst + 2 * planeSize, 1, &normalizationScale, dst + 2 * planeSize, 1, vDSP_Length(planeSize))
 
-            vDSP_vfltu8(bBytes, 1, dst + 2 * planeSize, 1, vDSP_Length(planeSize))
-            vDSP_vsmul(dst + 2 * planeSize, 1, &normalizationScale, dst + 2 * planeSize, 1, vDSP_Length(planeSize))
-        }
-
-        let byteCount = inputFloats.count * MemoryLayout<Float32>.stride
-        inputMutableData.length = byteCount
-        memcpy(inputMutableData.mutableBytes, inputFloats, byteCount)
-
-        return PreprocessMapping(
-            sourceWidth: sourceWidth,
-            sourceHeight: sourceHeight,
-            scale: scale,
-            offsetX: offsetX,
-            offsetY: offsetY
-        )
+        return mapping
     }
 
     // MARK: - Parsing
 
     private func parseDetections(
-        fromTensorBytes tensorBytes: Data,
+        fromTensorData tensorData: NSMutableData,
         shape: [Int],
         mapping: PreprocessMapping
     ) -> [Detection] {
-        return tensorBytes.withUnsafeBytes { raw in
-            guard let ptr = raw.baseAddress?.assumingMemoryBound(to: Float32.self) else {
-                return []
-            }
-            return parseDetections(from: ptr, shape: shape, mapping: mapping)
-        }
+        guard tensorData.length > 0 else { return [] }
+        let ptr = tensorData.bytes.assumingMemoryBound(to: Float32.self)
+        return parseDetections(from: ptr, shape: shape, mapping: mapping)
     }
 
     // shape 末兩維支援 [C, N] 與 [N, C]

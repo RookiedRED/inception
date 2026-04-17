@@ -19,6 +19,7 @@ final class DriveViewModel: ObservableObject {
     let cameraService = ARCameraService()
     let inferenceService = InferenceService()
     let miniMapService = MiniMapService()
+    let landmarkStore = LandmarkStore()
 
     // MARK: - Session (for non-rendering uses like MiniMap)
 
@@ -69,6 +70,7 @@ final class DriveViewModel: ObservableObject {
     func stop() {
         cameraService.stop()
         isInferring = false
+        landmarkStore.clear()
     }
 
     // MARK: - Orientation
@@ -161,6 +163,11 @@ final class DriveViewModel: ObservableObject {
                     self.miniMapService.updateTrackedObjects(objects)
                     self.trackedObjects = objects
                     self.detectionCount = objects.count
+
+                    // Save static objects as persistent landmarks.
+                    // Dynamic objects (people, vehicles, animals) are filtered out in LandmarkStore.
+                    self.landmarkStore.update(with: objects)
+                    self.miniMapService.updateLandmarks(self.landmarkStore.all)
 
                 case .failure(let error):
                     print("[FrameDebug] Inference FAILED: \(error)")

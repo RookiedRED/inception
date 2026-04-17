@@ -51,6 +51,8 @@ final class MiniMapService {
     private var objectNodes: [Int: SCNNode] = [:]
     private var meshNodes: [UUID: SCNNode] = [:]
     private var lastMeshRefreshTime: [UUID: TimeInterval] = [:]
+    private var landmarkNodes: [UUID: SCNNode] = [:]
+    private let landmarksRootNode = SCNNode()
 
     // MARK: - State
 
@@ -83,6 +85,7 @@ final class MiniMapService {
         rotationRootNode.addChildNode(translationRootNode)
 
         translationRootNode.addChildNode(environmentRootNode)
+        translationRootNode.addChildNode(landmarksRootNode)
         translationRootNode.addChildNode(objectsRootNode)
 
         panRootNode.addChildNode(userMarkerNode)
@@ -167,7 +170,7 @@ final class MiniMapService {
         userMarkerNode.addChildNode(arrowNode)
 
         userMarkerNode.position = SCNVector3Zero
-        userMarkerNode.scale = SCNVector3(1.5, 1.5, 1.5)
+        userMarkerNode.scale = SCNVector3(2, 2, 2)
     }
 
     private func setupHeadingMarker() {
@@ -266,6 +269,34 @@ final class MiniMapService {
 
         for (id, node) in objectNodes where !visibleIds.contains(id) {
             node.removeFromParentNode()
+        }
+    }
+
+    /// Updates persistent landmark pins on the minimap.
+    /// Landmarks remain visible even when the camera moves away.
+    func updateLandmarks(_ landmarks: [Landmark]) {
+        let currentIds = Set(landmarks.map(\.id))
+
+        for landmark in landmarks {
+            let node: SCNNode
+            if let existing = landmarkNodes[landmark.id],
+               existing.name == landmark.className {
+                node = existing
+            } else {
+                landmarkNodes[landmark.id]?.removeFromParentNode()
+                node = makeLandmarkNode(for: landmark)
+            }
+            landmarkNodes[landmark.id] = node
+            node.position = SCNVector3(landmark.worldPosition.x, 0.12, landmark.worldPosition.z)
+            if node.parent !== landmarksRootNode {
+                node.removeFromParentNode()
+                landmarksRootNode.addChildNode(node)
+            }
+        }
+
+        for (id, node) in landmarkNodes where !currentIds.contains(id) {
+            node.removeFromParentNode()
+            landmarkNodes.removeValue(forKey: id)
         }
     }
 
@@ -442,6 +473,46 @@ final class MiniMapService {
         let stemNode = SCNNode(geometry: stem)
         stemNode.position = SCNVector3(0, 0.13, 0)
         node.addChildNode(stemNode)
+
+        return node
+    }
+
+    /// Landmark pin: hexagonal base + faded icon billboard.
+    /// Visually distinct from live tracked objects (circular base, full opacity).
+    private func makeLandmarkNode(for landmark: Landmark) -> SCNNode {
+        let node = SCNNode()
+        node.name = landmark.className
+        let accent = accentColor(for: landmark.className)
+
+        // Hexagonal ring base (6 segments) — distinguishes landmark from live circle
+        let ring = SCNTube(innerRadius: 0.09, outerRadius: 0.14, height: 0.012)
+        ring.radialSegmentCount = 6
+        ring.materials = Array(repeating: makeFlatMaterial(color: accent.withAlphaComponent(0.55)), count: 3)
+        let ringNode = SCNNode(geometry: ring)
+        ringNode.position = SCNVector3(0, 0.006, 0)
+        node.addChildNode(ringNode)
+
+        // Thin stem
+        let stem = SCNCylinder(radius: 0.010, height: 0.17)
+        stem.materials = Array(repeating: makeFlatMaterial(color: accent.withAlphaComponent(0.45)), count: 3)
+        let stemNode = SCNNode(geometry: stem)
+        stemNode.position = SCNVector3(0, 0.11, 0)
+        node.addChildNode(stemNode)
+
+        // Faded icon billboard — same icon as live objects, lower opacity
+        let iconPlane = SCNPlane(width: 0.46, height: 0.46)
+        iconPlane.cornerRadius = 0.08
+        let iconMat = makeSpriteMaterial(
+            image: iconImage(for: landmark.className, tintColor: accent)
+        )
+        iconMat.transparency = 0.38   // 62% visible — clearly "ghost" compared to live
+        iconPlane.firstMaterial = iconMat
+
+        let iconNode = SCNNode(geometry: iconPlane)
+        iconNode.name = "icon"
+        iconNode.position = SCNVector3(0, 0.38, 0)
+        iconNode.constraints = [SCNBillboardConstraint()]
+        node.addChildNode(iconNode)
 
         return node
     }

@@ -14,12 +14,19 @@ struct MiniMapView: UIViewRepresentable {
     let onZoomChanged: (Double) -> Void
     let onPanChanged: (CGPoint, CGSize) -> Void
     let onToggleRequested: () -> Void
+    /// Called with the landmark UUID when the user taps a landmark node,
+    /// or nil when tapping empty space.
+    let onLandmarkTapped: (UUID?) -> Void
+    /// Returns the landmark UUID at `point` in `view`, or nil if none.
+    let landmarkHitTest: (CGPoint, SCNView) -> UUID?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             onZoomChanged: onZoomChanged,
             onPanChanged: onPanChanged,
-            onToggleRequested: onToggleRequested
+            onToggleRequested: onToggleRequested,
+            onLandmarkTapped: onLandmarkTapped,
+            landmarkHitTest: landmarkHitTest
         )
     }
 
@@ -85,6 +92,8 @@ extension MiniMapView {
         private let onZoomChanged: (Double) -> Void
         private let onPanChanged: (CGPoint, CGSize) -> Void
         private let onToggleRequested: () -> Void
+        private let onLandmarkTapped: (UUID?) -> Void
+        private let landmarkHitTest: (CGPoint, SCNView) -> UUID?
         private weak var view: SCNView?
         private var currentZoomScale: Double = 1.0
         private var gestureStartZoomScale: Double = 1.0
@@ -93,11 +102,15 @@ extension MiniMapView {
         init(
             onZoomChanged: @escaping (Double) -> Void,
             onPanChanged: @escaping (CGPoint, CGSize) -> Void,
-            onToggleRequested: @escaping () -> Void
+            onToggleRequested: @escaping () -> Void,
+            onLandmarkTapped: @escaping (UUID?) -> Void,
+            landmarkHitTest: @escaping (CGPoint, SCNView) -> UUID?
         ) {
             self.onZoomChanged = onZoomChanged
             self.onPanChanged = onPanChanged
             self.onToggleRequested = onToggleRequested
+            self.onLandmarkTapped = onLandmarkTapped
+            self.landmarkHitTest = landmarkHitTest
         }
 
         func attach(to view: SCNView) {
@@ -113,8 +126,13 @@ extension MiniMapView {
 
         @objc
         func handleTap(_ gesture: UITapGestureRecognizer) {
-            guard gesture.state == .ended else { return }
-            onToggleRequested()
+            guard gesture.state == .ended, let view else { return }
+            let point = gesture.location(in: view)
+            if let id = landmarkHitTest(point, view) {
+                onLandmarkTapped(id)
+            } else {
+                onToggleRequested()
+            }
         }
 
         @objc

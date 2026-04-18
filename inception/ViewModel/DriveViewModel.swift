@@ -20,6 +20,7 @@ final class DriveViewModel: ObservableObject {
     let inferenceService = InferenceService()
     let miniMapService = MiniMapService()
     let landmarkStore = LandmarkStore()
+    let navigationService = NavigationService()
 
     // MARK: - Session (for non-rendering uses like MiniMap)
 
@@ -33,6 +34,28 @@ final class DriveViewModel: ObservableObject {
     @Published var detectionCount: Int = 0
     @Published var orientation: AppOrientation = .normal
     @Published var imageResolution: CGSize = .zero
+
+    // MARK: - Navigation State
+
+    /// The landmark the user tapped on the minimap (shows detail panel).
+    @Published var selectedLandmark: Landmark?
+    /// True while actively navigating toward a destination.
+    @Published var isNavigating = false
+    /// True while a navigation route is being planned or refreshed.
+    @Published var isCalculatingNavigation = false
+    /// True for 3 seconds when the user reaches the destination.
+    @Published var navigationArrivedMessage = false
+    /// Current route waypoints displayed on the minimap.
+    @Published var navigationRoute: [simd_float3] = []
+
+    private var navigationTargetID: UUID?
+    /// Index into `navigationRoute` of the next waypoint to reach.
+    private var navigationWaypointIndex = 0
+    private var navigationRequestID = UUID()
+    private var lastRouteRefreshTime: CFTimeInterval = 0
+    private var lastRouteRefreshPosition: simd_float3?
+    private let routeRefreshInterval: CFTimeInterval = 1.4
+    private let routeRefreshDistanceThreshold: Float = 0.75
 
     // MARK: - Internal State
 
@@ -71,6 +94,7 @@ final class DriveViewModel: ObservableObject {
         cameraService.stop()
         isInferring = false
         landmarkStore.clear()
+        cancelNavigation()
     }
 
     // MARK: - Orientation
@@ -117,6 +141,7 @@ final class DriveViewModel: ObservableObject {
             self.cameraPixelBuffer = pixelBuffer
             self.imageResolution = context.imageResolution
             self.updateMiniMapCamera(with: context)
+            self.updateNavigationProgress()
         }
 
         frameCount += 1
@@ -304,5 +329,193 @@ final class DriveViewModel: ObservableObject {
 
     func panExpandedMiniMap(by translation: CGPoint, viewportSize: CGSize) {
         miniMapService.panExpandedMap(byScreenTranslation: translation, viewportSize: viewportSize)
+    }
+
+    // MARK: - Landmark Selection
+
+    func selectLandmark(id: UUID?) {
+        if id != selectedLandmark?.id {
+            invalidatePendingNavigationRequest()
+        }
+        miniMapService.setSelectedLandmarkID(id)
+        selectedLandmark = id.flatMap { uuid in landmarkStore.all.first { $0.id == uuid } }
+    }
+
+    func confirmSelectedLandmarkNavigation() {
+        guard let selectedLandmark else { return }
+        startNavigation(to: selectedLandmark)
+    }
+
+    // MARK: - Navigation
+
+    /// Distance in XZ plane from the user to the final destination waypoint.
+    var navigationDistance: Float? {
+        guard isNavigating, let last = navigationRoute.last else { return nil }
+        let u = miniMapService.userPosition
+        return simd_distance(SIMD2<Float>(u.x, u.z), SIMD2<Float>(last.x, last.z))
+    }
+
+    /// Distance from user to the currently-targeted landmark (for detail panel display).
+    func distanceToLandmark(_ landmark: Landmark) -> Float {
+        let u = miniMapService.userPosition
+        let l = landmark.worldPosition
+        return simd_distance(SIMD2<Float>(u.x, u.z), SIMD2<Float>(l.x, l.z))
+    }
+
+    /// Build an occupancy map and start navigating to `landmark`.
+    func startNavigation(to landmark: Landmark) {
+        let anchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+        let start = miniMapService.userPosition
+        let requestID = UUID()
+        navigationRequestID = requestID
+        isCalculatingNavigation = true
+        isNavigating = false
+        navigationArrivedMessage = false
+        navigationTargetID = landmark.id
+        navigationWaypointIndex = 0
+
+        navigationService.calculateRoute(from: start, to: landmark.worldPosition, using: anchors) { [weak self] route in
+            guard let self, self.navigationRequestID == requestID else { return }
+            self.applyNavigationRoute(route, targetLandmarkID: landmark.id, from: start)
+            self.selectLandmark(id: nil)
+        }
+    }
+
+    func cancelNavigation() {
+        invalidatePendingNavigationRequest()
+        isNavigating = false
+        navigationRoute = []
+        navigationTargetID = nil
+        navigationWaypointIndex = 0
+        lastRouteRefreshPosition = nil
+        lastRouteRefreshTime = 0
+        miniMapService.updateNavigationRoute([], targetLandmarkID: nil)
+    }
+
+    // MARK: - Navigation Progress
+
+    private func updateNavigationProgress() {
+        guard isNavigating, !navigationRoute.isEmpty, !navigationArrivedMessage else { return }
+
+        let user = miniMapService.userPosition
+        let userFlat = SIMD2<Float>(user.x, user.z)
+        let didAdvanceWaypoint = advanceWaypointIndex(for: userFlat)
+
+        if didAdvanceWaypoint {
+            updateDisplayedNavigationRoute(from: user)
+        }
+
+        maybeRefreshNavigationRoute(from: user)
+
+        // Check arrival at final destination
+        guard let last = navigationRoute.last else { return }
+        if simd_distance(userFlat, SIMD2<Float>(last.x, last.z)) < 1.5 {
+            handleArrival()
+        }
+    }
+
+    private func handleArrival() {
+        invalidatePendingNavigationRequest()
+        isNavigating = false
+        navigationArrivedMessage = true
+        miniMapService.updateNavigationRoute([], targetLandmarkID: nil)
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            self.navigationArrivedMessage = false
+            self.navigationRoute = []
+        }
+    }
+
+    private func applyNavigationRoute(_ route: [simd_float3], targetLandmarkID: UUID, from start: simd_float3) {
+        navigationRoute = route
+        isNavigating = true
+        isCalculatingNavigation = false
+        navigationArrivedMessage = false
+        navigationTargetID = targetLandmarkID
+        navigationWaypointIndex = min(1, max(route.count - 1, 0))
+        lastRouteRefreshPosition = start
+        lastRouteRefreshTime = CACurrentMediaTime()
+        updateDisplayedNavigationRoute(from: start)
+    }
+
+    private func invalidatePendingNavigationRequest() {
+        navigationRequestID = UUID()
+        isCalculatingNavigation = false
+    }
+
+    private func advanceWaypointIndex(for userFlat: SIMD2<Float>) -> Bool {
+        var advanced = false
+        while navigationWaypointIndex < navigationRoute.count - 1 {
+            let waypoint = navigationRoute[navigationWaypointIndex]
+            if simd_distance(userFlat, SIMD2<Float>(waypoint.x, waypoint.z)) < 1.0 {
+                navigationWaypointIndex += 1
+                advanced = true
+            } else {
+                break
+            }
+        }
+        return advanced
+    }
+
+    private func maybeRefreshNavigationRoute(from user: simd_float3) {
+        guard !isCalculatingNavigation,
+              let targetID = navigationTargetID,
+              let landmark = landmarkStore.all.first(where: { $0.id == targetID }) else {
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        guard now - lastRouteRefreshTime >= routeRefreshInterval else { return }
+
+        let movedDistance = simd_distance(
+            SIMD2<Float>(user.x, user.z),
+            SIMD2<Float>(lastRouteRefreshPosition?.x ?? user.x, lastRouteRefreshPosition?.z ?? user.z)
+        )
+        guard movedDistance >= routeRefreshDistanceThreshold else { return }
+
+        let anchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+        let requestID = UUID()
+        navigationRequestID = requestID
+        isCalculatingNavigation = true
+        lastRouteRefreshTime = now
+        lastRouteRefreshPosition = user
+
+        navigationService.calculateRoute(from: user, to: landmark.worldPosition, using: anchors) { [weak self] route in
+            guard let self, self.navigationRequestID == requestID, self.isNavigating else { return }
+            self.applyNavigationRoute(route, targetLandmarkID: landmark.id, from: user)
+        }
+    }
+
+    private func updateDisplayedNavigationRoute(from user: simd_float3) {
+        guard isNavigating, !navigationRoute.isEmpty else {
+            miniMapService.updateNavigationRoute([], targetLandmarkID: navigationTargetID)
+            return
+        }
+
+        var remaining = Array(navigationRoute.dropFirst(navigationWaypointIndex))
+        if remaining.isEmpty, let destination = navigationRoute.last {
+            remaining = [destination]
+        }
+
+        if let first = remaining.first {
+            let userFlat = SIMD2<Float>(user.x, user.z)
+            let firstFlat = SIMD2<Float>(first.x, first.z)
+            if simd_distance(userFlat, firstFlat) > 0.05 {
+                remaining.insert(user, at: 0)
+            } else {
+                remaining[0] = user
+            }
+        }
+
+        if remaining.count == 1, let destination = navigationRoute.last {
+            let destinationFlat = SIMD2<Float>(destination.x, destination.z)
+            let userFlat = SIMD2<Float>(user.x, user.z)
+            if simd_distance(userFlat, destinationFlat) > 0.05 {
+                remaining.append(destination)
+            }
+        }
+
+        miniMapService.updateNavigationRoute(remaining, targetLandmarkID: navigationTargetID)
     }
 }

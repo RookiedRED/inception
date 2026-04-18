@@ -35,6 +35,7 @@ final class MiniMapService {
     private let translationRootNode = SCNNode()
 
     private let environmentRootNode = SCNNode()
+    private let routeRootNode = SCNNode()
     private let objectsRootNode = SCNNode()
 
     /// User marker and heading live outside world transform tree,
@@ -53,11 +54,18 @@ final class MiniMapService {
     private var lastMeshRefreshTime: [UUID: TimeInterval] = [:]
     private var landmarkNodes: [UUID: SCNNode] = [:]
     private let landmarksRootNode = SCNNode()
+    private var selectedLandmarkID: UUID?
 
     // MARK: - State
 
     private var lastUserPosition = simd_float3.zero
     private var lastYaw: Float = 0
+
+    /// Latest smoothed world-space user position (XZ plane).
+    var userPosition: simd_float3 { lastUserPosition }
+
+    /// Latest smoothed user heading in radians (angle from +Z axis, with landscape offset).
+    var userHeading: Float { lastYaw }
     private var hasSmoothedCameraState = false
     private var presentationMode: PresentationMode = .compact
     private var expandedZoomScale: Double = 1.0
@@ -72,8 +80,8 @@ final class MiniMapService {
     private let maxFacesPerAnchor = 1_500
     private let positionSmoothingAlpha: Float = 0.18
     private let yawSmoothingAlpha: Float = 0.14
-    private let compactOrthographicScale: Double = 3.4
-    private let expandedOrthographicScale: Double = 6.2
+    private let compactOrthographicScale: Double = 3.2
+    private let expandedOrthographicScale: Double = 6.0
     private let minimumExpandedZoomScale: Double = 0.55
     private let maximumExpandedZoomScale: Double = 2.4
 
@@ -85,6 +93,7 @@ final class MiniMapService {
         rotationRootNode.addChildNode(translationRootNode)
 
         translationRootNode.addChildNode(environmentRootNode)
+        translationRootNode.addChildNode(routeRootNode)
         translationRootNode.addChildNode(landmarksRootNode)
         translationRootNode.addChildNode(objectsRootNode)
 
@@ -279,8 +288,7 @@ final class MiniMapService {
 
         for landmark in landmarks {
             let node: SCNNode
-            if let existing = landmarkNodes[landmark.id],
-               existing.name == landmark.className {
+            if let existing = landmarkNodes[landmark.id] {
                 node = existing
             } else {
                 landmarkNodes[landmark.id]?.removeFromParentNode()
@@ -292,6 +300,7 @@ final class MiniMapService {
                 node.removeFromParentNode()
                 landmarksRootNode.addChildNode(node)
             }
+            applySelectionStyle(to: node, isSelected: landmark.id == selectedLandmarkID)
         }
 
         for (id, node) in landmarkNodes where !currentIds.contains(id) {
@@ -331,6 +340,44 @@ final class MiniMapService {
         expandedPanOffset.x += worldDeltaX
         expandedPanOffset.y += worldDeltaZ
         updateMiniMapCamera()
+    }
+
+    func landmarkID(at point: CGPoint, in view: SCNView) -> UUID? {
+        let hitResults = view.hitTest(point, options: nil)
+
+        for result in hitResults {
+            var node: SCNNode? = result.node
+            while let current = node {
+                if let landmarkID = landmarkID(from: current.name) {
+                    return landmarkID
+                }
+                node = current.parent
+            }
+        }
+
+        return nil
+    }
+
+    func setSelectedLandmarkID(_ id: UUID?) {
+        guard selectedLandmarkID != id else { return }
+        selectedLandmarkID = id
+        refreshLandmarkSelectionAppearance()
+    }
+
+    func updateNavigationRoute(_ points: [simd_float3], targetLandmarkID: UUID?) {
+        routeRootNode.childNodes.forEach { $0.removeFromParentNode() }
+
+        guard points.count >= 2 else { return }
+
+        for index in 0..<(points.count - 1) {
+            let segmentNode = makeRouteSegmentNode(from: points[index], to: points[index + 1])
+            routeRootNode.addChildNode(segmentNode)
+        }
+
+        if let lastPoint = points.last {
+            let endpointNode = makeRouteEndpointNode(at: lastPoint)
+            routeRootNode.addChildNode(endpointNode)
+        }
     }
 
     func updateMeshAnchors(_ anchors: [ARMeshAnchor]) {
@@ -392,13 +439,13 @@ final class MiniMapService {
         switch presentationMode {
         case .compact:
             cameraNode.camera?.orthographicScale = compactOrthographicScale
-            cameraRigNode.position = SCNVector3(0, 2.8, 3.6)
+            cameraRigNode.position = SCNVector3(0, 2.4, 3.2)
             cameraNode.look(at: SCNVector3(0, 0.2, 0))
             panRootNode.position = SCNVector3Zero
 
         case .expanded:
             cameraNode.camera?.orthographicScale = expandedOrthographicScale / expandedZoomScale
-            cameraRigNode.position = SCNVector3(0, 5.2, 6.8)
+            cameraRigNode.position = SCNVector3(0, 4.8, 6.4)
             cameraNode.look(at: SCNVector3(0, 0.15, 0))
             panRootNode.position = SCNVector3(expandedPanOffset.x, 0, expandedPanOffset.y)
         }
@@ -481,7 +528,7 @@ final class MiniMapService {
     /// Visually distinct from live tracked objects (circular base, full opacity).
     private func makeLandmarkNode(for landmark: Landmark) -> SCNNode {
         let node = SCNNode()
-        node.name = landmark.className
+        node.name = landmarkNodeName(for: landmark.id)
         let accent = accentColor(for: landmark.className)
 
         // Hexagonal ring base (6 segments) — distinguishes landmark from live circle
@@ -514,6 +561,71 @@ final class MiniMapService {
         iconNode.constraints = [SCNBillboardConstraint()]
         node.addChildNode(iconNode)
 
+        return node
+    }
+
+    private func landmarkNodeName(for id: UUID) -> String {
+        "landmark:\(id.uuidString)"
+    }
+
+    private func landmarkID(from nodeName: String?) -> UUID? {
+        guard let nodeName,
+              nodeName.hasPrefix("landmark:") else {
+            return nil
+        }
+
+        return UUID(uuidString: String(nodeName.dropFirst("landmark:".count)))
+    }
+
+    private func refreshLandmarkSelectionAppearance() {
+        for (id, node) in landmarkNodes {
+            applySelectionStyle(to: node, isSelected: id == selectedLandmarkID)
+        }
+    }
+
+    private func applySelectionStyle(to node: SCNNode, isSelected: Bool) {
+        let scale: Float = isSelected ? 1.42 : 1.0
+        node.scale = SCNVector3(scale, scale, scale)
+        node.opacity = isSelected ? 1.0 : 0.9
+    }
+
+    private func makeRouteSegmentNode(from start: simd_float3, to end: simd_float3) -> SCNNode {
+        let planarStart = SIMD2<Float>(start.x, start.z)
+        let planarEnd = SIMD2<Float>(end.x, end.z)
+        let segmentLength = simd_distance(planarStart, planarEnd)
+
+        let geometry = SCNBox(
+            width: 0.09,
+            height: 0.018,
+            length: max(CGFloat(segmentLength), 0.05),
+            chamferRadius: 0.018
+        )
+        geometry.materials = Array(
+            repeating: makeFlatMaterial(
+                color: UIColor(red: 1.0, green: 0.72, blue: 0.16, alpha: 0.95)
+            ),
+            count: 6
+        )
+
+        let node = SCNNode(geometry: geometry)
+        let midpoint = (start + end) * 0.5
+        node.position = SCNVector3(midpoint.x, 0.03, midpoint.z)
+        node.eulerAngles.y = atan2(end.x - start.x, end.z - start.z)
+        return node
+    }
+
+    private func makeRouteEndpointNode(at point: simd_float3) -> SCNNode {
+        let geometry = SCNTube(innerRadius: 0.12, outerRadius: 0.19, height: 0.015)
+        geometry.radialSegmentCount = 36
+        geometry.materials = Array(
+            repeating: makeFlatMaterial(
+                color: UIColor(red: 1.0, green: 0.83, blue: 0.24, alpha: 0.92)
+            ),
+            count: 3
+        )
+
+        let node = SCNNode(geometry: geometry)
+        node.position = SCNVector3(point.x, 0.035, point.z)
         return node
     }
 

@@ -27,7 +27,22 @@ struct RootView: View {
                 )
                 .ignoresSafeArea()
 
-                miniMap()
+                if isMiniMapExpanded {
+                    miniMap()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .ignoresSafeArea()
+                        .zIndex(10)
+                } else {
+                    miniMap()
+                        .frame(width: 180, height: 180)
+                        .aspectRatio(1, contentMode: .fit)
+                        .frame(
+                            maxWidth: .infinity,
+                            maxHeight: .infinity,
+                            alignment: .bottomTrailing
+                        )
+                        .zIndex(2)
+                }
 
                 HUDView(
                     inferenceMs: viewModel.inferenceMs,
@@ -39,21 +54,21 @@ struct RootView: View {
                     maxHeight: .infinity,
                     alignment: viewModel.orientation.isFlipped ? .bottom : .top
                 )
+                .padding(.horizontal, 16)
                 .padding(.top, viewModel.orientation.isFlipped ? 0 : safeInsets.top + 16)
                 .padding(.bottom, viewModel.orientation.isFlipped ? safeInsets.bottom + 16 : 0)
-                .padding(.horizontal, 16)
+                .zIndex(20)
 
-                if showsNavigationPrompt, viewModel.isNavigating, let dist = viewModel.navigationDistance {
+                if showsNavigationPrompt, viewModel.isNavigating {
+                    let navDist = viewModel.navigationDistance
                     NavigationSidePromptView(
-                        distanceMeters: dist,
-                        isUpdating: viewModel.isCalculatingNavigation,
+                        distanceMeters: navDist,
+                        isUpdating: viewModel.isCalculatingNavigation || navDist == nil,
                         onCancel: { viewModel.cancelNavigation() }
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                    .padding(.leading, 16)
-                    .padding(.top, safeInsets.top + 76)
-                    .padding(.bottom, safeInsets.bottom + 16)
                     .transition(.move(edge: .leading).combined(with: .opacity))
+                    .zIndex(30)
                 }
 
                 if let landmark = viewModel.selectedLandmark, !viewModel.isNavigating {
@@ -65,10 +80,8 @@ struct RootView: View {
                         onDismiss: { viewModel.selectLandmark(id: nil) }
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
-                    .padding(.trailing, 16)
-                    .padding(.top, safeInsets.top + 92)
-                    .padding(.bottom, max(safeInsets.bottom + 20, isMiniMapExpanded ? safeInsets.bottom + 20 : 116))
                     .transition(.move(edge: .trailing).combined(with: .opacity))
+                    .zIndex(30)
                 }
 
                 if viewModel.navigationArrivedMessage {
@@ -77,11 +90,12 @@ struct RootView: View {
                         .padding(.top, safeInsets.top + 18)
                         .padding(.horizontal, 20)
                         .transition(.scale(scale: 0.85).combined(with: .opacity))
+                        .zIndex(40)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .ignoresSafeArea()
         .onAppear { viewModel.start() }
         .onDisappear { viewModel.stop() }
         .onChange(of: viewModel.isNavigating) { _, isNavigating in
@@ -132,7 +146,6 @@ struct RootView: View {
                 setMiniMapExpanded(!isMiniMapExpanded)
             },
             onLandmarkTapped: { id in
-                // Expand minimap if compact, then select landmark
                 if !isMiniMapExpanded {
                     setMiniMapExpanded(true)
                 }
@@ -142,30 +155,13 @@ struct RootView: View {
                 viewModel.miniMapService.landmarkID(at: point, in: scnView)
             }
         )
-            .if(isMiniMapExpanded) { view in
-                view
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .ignoresSafeArea()
-            }
-            .if(!isMiniMapExpanded) { view in
-                view
-                    .frame(width: 180, height: 180)
-                    .aspectRatio(1, contentMode: .fit)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: isMiniMapExpanded ? 0 : 12))
-            .overlay {
-                RoundedRectangle(cornerRadius: isMiniMapExpanded ? 0 : 12)
-                    .stroke(Color.white.opacity(0.85), lineWidth: isMiniMapExpanded ? 0 : 1)
-            }
-            .shadow(color: .black.opacity(0.22), radius: isMiniMapExpanded ? 0 : 18, y: 8)
-            .frame(
-                maxWidth: .infinity,
-                maxHeight: .infinity,
-                alignment: isMiniMapExpanded ? .center : .bottomTrailing
-            )
-            .padding(.trailing, isMiniMapExpanded ? 0 : 16)
-            .padding(.bottom, isMiniMapExpanded ? 0 : 24)
-            .contentShape(Rectangle())
+        .clipShape(RoundedRectangle(cornerRadius: isMiniMapExpanded ? 0 : 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: isMiniMapExpanded ? 0 : 12)
+                .stroke(Color.white.opacity(0.85), lineWidth: isMiniMapExpanded ? 0 : 1)
+        }
+        .shadow(color: .black.opacity(0.22), radius: isMiniMapExpanded ? 0 : 18, y: 8)
+        .contentShape(Rectangle())
     }
 
     private func setMiniMapExpanded(_ isExpanded: Bool) {

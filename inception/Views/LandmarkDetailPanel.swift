@@ -19,15 +19,10 @@ struct LandmarkCalloutView: View {
                 Text("Navigate to the \(landmark.className.lowercased())")
                     .font(.system(.headline, design: .rounded, weight: .semibold))
                     .foregroundStyle(.white)
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14)
-                        .fill(accentColor(for: landmark.className).opacity(0.92))
-                        .frame(width: 80, height:80 )
-                    
-                    Image(systemName: symbolName(for: landmark.className))
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
+                Image(systemName: symbolName(for: landmark.className))
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.4), radius: 4, x: 0, y: 2)
             }.frame(maxWidth: .infinity)
             
             Spacer()
@@ -84,8 +79,8 @@ struct LandmarkCalloutView: View {
 
     private var distanceString: String {
         distanceMeters < 10
-            ? String(format: "%.1f 公尺", distanceMeters)
-            : String(format: "%.0f 公尺", distanceMeters)
+            ? String(format: "%.1f M", distanceMeters)
+            : String(format: "%.0f M", distanceMeters)
     }
 
     private func symbolName(for className: String) -> String {
@@ -125,7 +120,7 @@ struct LandmarkCalloutView: View {
 }
 
 struct NavigationSidePromptView: View {
-    let distanceMeters: Float
+    let distanceMeters: Float?
     let isUpdating: Bool
     let onCancel: () -> Void
 
@@ -143,7 +138,7 @@ struct NavigationSidePromptView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("導航中")
+                    Text("Navigating")
                         .font(.system(.caption, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.65))
 
@@ -159,18 +154,18 @@ struct NavigationSidePromptView: View {
                         .tint(.white)
                         .scaleEffect(0.95)
 
-                    Text("正在更新路線")
+                    Text("Route being updated")
                         .font(.system(.caption, weight: .medium))
                         .foregroundStyle(.white.opacity(0.72))
                 } else {
-                    Text("路線會隨位置更新")
+                    Text("The route will be updated based on location.")
                         .font(.system(.caption, weight: .medium))
                         .foregroundStyle(.white.opacity(0.72))
                 }
             }
 
             Button(action: onCancel) {
-                Text("取消導航")
+                Text("Cancel")
                     .font(.system(.subheadline, weight: .semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 9)
@@ -190,9 +185,10 @@ struct NavigationSidePromptView: View {
     }
 
     private var distanceString: String {
-        if distanceMeters < 1.5 { return "即將抵達" }
-        if distanceMeters < 10 { return String(format: "%.1f 公尺", distanceMeters) }
-        return String(format: "%.0f 公尺", distanceMeters)
+        guard let d = distanceMeters else { return "Route planning in progress..." }
+        if d < 1.5 { return "Arriving soon" }
+        if d < 10  { return String(format: "%.1f M", d) }
+        return String(format: "%.0f M", d)
     }
 }
 

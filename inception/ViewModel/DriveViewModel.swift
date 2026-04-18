@@ -165,8 +165,8 @@ final class DriveViewModel: ObservableObject {
                 let inferLatency = (CACurrentMediaTime() - dispatchTime) * 1000
                 defer {
                     self.isInferring = false
-                    print(String(format: "[FrameDebug] INFER: latency=%.1fms thread=%@",
-                                 inferLatency, Thread.isMainThread ? "main" : "bg"))
+//                    print(String(format: "[FrameDebug] INFER: latency=%.1fms thread=%@",
+//                                 inferLatency, Thread.isMainThread ? "main" : "bg"))
                 }
 
                 switch result {
@@ -205,7 +205,7 @@ final class DriveViewModel: ObservableObject {
             // Only print occasionally to avoid log spam
             if frameCount % 30 == 0 {
                 let totalMs = (CACurrentMediaTime() - t0) * 1000
-                print(String(format: "[FrameDebug] PREVIEW: total=%.1fms", totalMs))
+//                print(String(format: "[FrameDebug] PREVIEW: total=%.1fms", totalMs))
             }
         }
     }
@@ -251,7 +251,7 @@ final class DriveViewModel: ObservableObject {
         let bbox = detection.bbox
         let imagePoint = CGPoint(
             x: min(max(bbox.midX * imageResolution.width, 0), imageResolution.width),
-            y: min(max((bbox.maxY - 0.02) * imageResolution.height, 0), imageResolution.height)
+            y: min(max(bbox.midY * imageResolution.height, 0), imageResolution.height)
         )
         let depthPoint = CGPoint(
             x: imagePoint.x * depthResolution.width / imageResolution.width,
@@ -395,17 +395,22 @@ final class DriveViewModel: ObservableObject {
     // MARK: - Navigation Progress
 
     private func updateNavigationProgress() {
-        guard isNavigating, !navigationRoute.isEmpty, !navigationArrivedMessage else { return }
+        guard isNavigating, !navigationArrivedMessage else { return }
 
         let user = miniMapService.userPosition
+
+        // Always try to refresh; this also retries when route is empty (no path
+        // was found last time — keep polling as the scene mesh improves).
+        maybeRefreshNavigationRoute(from: user)
+
+        guard !navigationRoute.isEmpty else { return }
+
         let userFlat = SIMD2<Float>(user.x, user.z)
         let didAdvanceWaypoint = advanceWaypointIndex(for: userFlat)
 
         if didAdvanceWaypoint {
             updateDisplayedNavigationRoute(from: user)
         }
-
-        maybeRefreshNavigationRoute(from: user)
 
         // Check arrival at final destination
         guard let last = navigationRoute.last else { return }
@@ -472,7 +477,9 @@ final class DriveViewModel: ObservableObject {
             SIMD2<Float>(user.x, user.z),
             SIMD2<Float>(lastRouteRefreshPosition?.x ?? user.x, lastRouteRefreshPosition?.z ?? user.z)
         )
-        guard movedDistance >= routeRefreshDistanceThreshold else { return }
+        // When no valid path exists yet, retry on timer alone (no movement needed).
+        // Once a route is established, require the user to move before recalculating.
+        guard movedDistance >= routeRefreshDistanceThreshold || navigationRoute.isEmpty else { return }
 
         let anchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
         let requestID = UUID()

@@ -52,6 +52,12 @@ final class MiniMapService {
     private var objectNodes: [Int: SCNNode] = [:]
     private var meshNodes: [UUID: SCNNode] = [:]
     private var lastMeshRefreshTime: [UUID: TimeInterval] = [:]
+    /// Background queue for expensive SCNGeometry construction.
+    private let geometryQueue = DispatchQueue(
+        label: "inception.minimap.geometry",
+        qos: .utility,
+        attributes: .concurrent
+    )
     private var landmarkNodes: [UUID: SCNNode] = [:]
     private let landmarksRootNode = SCNNode()
     private var selectedLandmarkID: UUID?
@@ -76,12 +82,12 @@ final class MiniMapService {
     /// If a face normal is too close to world up/down, we treat it as a horizontal surface.
     /// Raising this value keeps more slanted surfaces; lowering removes more near-horizontal faces.
     private let horizontalFaceThreshold: Float = 0.88
-    private let meshRefreshInterval: TimeInterval = 1.0
-    private let maxFacesPerAnchor = 1_500
+    private let meshRefreshInterval: TimeInterval = 2.5
+    private let maxFacesPerAnchor = 1_000
     private let positionSmoothingAlpha: Float = 0.18
     private let yawSmoothingAlpha: Float = 0.14
     private let compactOrthographicScale: Double = 3.2
-    private let expandedOrthographicScale: Double = 6.0
+    private let expandedOrthographicScale: Double = 5.0
     private let minimumExpandedZoomScale: Double = 0.55
     private let maximumExpandedZoomScale: Double = 2.4
 
@@ -418,7 +424,13 @@ final class MiniMapService {
 
                 meshNodes[anchor.identifier] = node
                 lastMeshRefreshTime[anchor.identifier] = now
+            } else if node.geometry != nil {
+                // Geometry refresh returned nil (sampled faces were all horizontal this cycle).
+                // Keep the existing geometry visible — do NOT remove the node.
+                // Omitting lastMeshRefreshTime update so this anchor retries on the next publish.
+                meshNodes[anchor.identifier] = node
             } else {
+                // No existing geometry and couldn't build one — discard.
                 node.removeFromParentNode()
                 meshNodes.removeValue(forKey: anchor.identifier)
                 lastMeshRefreshTime.removeValue(forKey: anchor.identifier)

@@ -20,14 +20,20 @@ final class NavigationService {
     /// Cells of clearance around each obstacle (~0.5 m).
     private let dilationCells: Int = 2
     /// Safety cap to keep pathfinding interactive.
-    private let maxAStarIterations = 3000
+    private let maxAStarIterations = 8_000
     /// Sample only 1-in-N faces per anchor to keep rebuild fast.
     private let faceStepDivisor = 800
 
     // MARK: - State
 
+    /// Cells confirmed as obstacle-free floor (upward-facing AR mesh faces).
+    /// A* only routes through these — unexplored areas are impassable.
+    private var exploredCells: Set<GridCell> = []
+    /// Cells marked as obstacles (walls / furniture) including dilation buffer.
     private var dilatedCells: Set<GridCell> = []
-    private let routeQueue = DispatchQueue(label: "inception.navigation.route", qos: .userInitiated)
+    /// Low-QoS queue: pathfinding runs at utility priority so it doesn't
+    /// compete with the SceneKit render loop on the main thread.
+    private let routeQueue = DispatchQueue(label: "inception.navigation.route", qos: .utility)
 
     // MARK: - Types
 
@@ -39,18 +45,24 @@ final class NavigationService {
     // MARK: - Public API
 
     /// Rebuild the occupancy map from AR scene mesh anchors.
-    /// Only vertical faces (walls, furniture sides) are treated as obstacles.
-    /// Safe to call on the main thread; uses stride sampling to stay fast.
+    ///
+    /// Face classification (world-space normals, gravity-aligned Y axis):
+    ///   • |dot(n, up)| < 0.5  → vertical → wall / obstacle
+    ///   •  dot(n, up) > 0.7   → upward-facing → navigable floor
+    ///   • everything else (ceiling, slanted) → ignored
+    ///
+    /// Only cells confirmed as floor are passable; unexplored areas are blocked.
     func rebuildOccupancy(from anchors: [ARMeshAnchor]) {
-        var raw: Set<GridCell> = []
+        var rawObstacles: Set<GridCell> = []
+        var rawFloor:     Set<GridCell> = []
 
         for anchor in anchors {
             let geo   = anchor.geometry
             let verts = geo.vertices
             let faces = geo.faces
             let faceCount = faces.count
-            let bpi = faces.bytesPerIndex          // bytes per index (2 or 4)
-            let ipf = faces.indexCountPerPrimitive // should be 3
+            let bpi = faces.bytesPerIndex
+            let ipf = faces.indexCountPerPrimitive
             guard ipf == 3, faceCount > 0 else { continue }
 
             let vBuf = verts.buffer.contents()
@@ -79,21 +91,28 @@ final class NavigationService {
                 let v1 = worldVertex(readIdx(1))
                 let v2 = worldVertex(readIdx(2))
 
-                // Compute face normal; skip degenerate and horizontal faces
                 let cross = simd_cross(v1 - v0, v2 - v0)
                 let area  = simd_length(cross)
                 guard area > 1e-6 else { continue }
                 let normal = cross / area
-                // abs(dot(n, up)) < 0.5 → mostly vertical → treat as wall
-                guard abs(simd_dot(normal, SIMD3<Float>(0, 1, 0))) < 0.5 else { continue }
 
-                raw.insert(worldToCell((v0 + v1 + v2) / 3))
+                let normalDotUp = simd_dot(normal, SIMD3<Float>(0, 1, 0))
+                let centroid    = (v0 + v1 + v2) / 3
+
+                if abs(normalDotUp) < 0.5 {
+                    // Vertical face → wall / obstacle
+                    rawObstacles.insert(worldToCell(centroid))
+                } else if normalDotUp > 0.7 {
+                    // Upward-facing horizontal face → navigable floor
+                    rawFloor.insert(worldToCell(centroid))
+                }
+                // Downward (ceiling) and slanted faces are discarded
             }
         }
 
-        // Dilate obstacles for safe clearance
-        var dilated = raw
-        for c in raw {
+        // Dilate obstacles to add safety clearance around walls
+        var dilated = rawObstacles
+        for c in rawObstacles {
             for dx in -dilationCells...dilationCells {
                 for dz in -dilationCells...dilationCells {
                     dilated.insert(GridCell(x: c.x + dx, z: c.z + dz))
@@ -101,21 +120,94 @@ final class NavigationService {
             }
         }
         dilatedCells = dilated
+
+        // Dilate floor by 4 cells (~1 m) to bridge the gaps between sparse AR
+        // floor scans.  A user walking through a 2 m corridor generates enough
+        // floor faces that the full corridor width becomes reachable after dilation.
+        var expandedFloor = rawFloor
+        for c in rawFloor {
+            for dx in -4...4 {
+                for dz in -4...4 {
+                    expandedFloor.insert(GridCell(x: c.x + dx, z: c.z + dz))
+                }
+            }
+        }
+        exploredCells = expandedFloor.subtracting(dilatedCells)
     }
 
     /// Find a smoothed path from `start` to `goal` through free space.
     /// Returns world-space XZ waypoints (Y held constant at `start.y`).
-    /// Falls back to a two-point straight line if A* cannot find a path.
+    /// Returns an empty array when no navigable path exists — never returns a
+    /// straight line that cuts through walls.
+    ///
+    /// Two-pass strategy:
+    ///   1. Prefer a path through confirmed floor only (unexplored = impassable).
+    ///   2. If that fails (sparse scan) fall back to obstacle-only mode so the
+    ///      user still sees *some* route rather than nothing.
     func findPath(from start: simd_float3, to goal: simd_float3) -> [simd_float3] {
-        let sc = worldToCell(start)
-        let gc = worldToCell(goal)
-        guard sc != gc else { return [goal] }
+        let startCell = worldToCell(start)
+        let goalCell  = worldToCell(goal)
 
-        let raw = astar(from: sc, to: gc)
-        guard !raw.isEmpty else { return [start, goal] }
+        // ── Pass 1: explored-floor constraint ──────────────────────────────
+        if !exploredCells.isEmpty {
+            let sc = nearestFreeCell(to: startCell)
+            let gc = nearestFreeCell(to: goalCell)
+            if sc != gc {
+                let raw = astar(from: sc, to: gc, exploredOnly: true)
+                if !raw.isEmpty {
+                    return smoothPath(raw.map { cellToWorld($0, y: start.y) })
+                }
+            }
+        }
 
-        let worldPath = raw.map { cellToWorld($0, y: start.y) }
-        return smoothPath(worldPath)
+        // ── Pass 2: obstacle-only fallback ─────────────────────────────────
+        // Floor data exists but no connected path through scanned floor yet
+        // (user hasn't scanned the full route).  Route through non-obstacle
+        // space so navigation is still usable.
+        let sc2 = nearestFreeCellObstacleOnly(to: startCell)
+        let gc2 = nearestFreeCellObstacleOnly(to: goalCell)
+        guard sc2 != gc2 else { return [goal] }
+
+        let raw2 = astar(from: sc2, to: gc2, exploredOnly: false)
+        guard !raw2.isEmpty else { return [] }
+        return smoothPath(raw2.map { cellToWorld($0, y: start.y) })
+    }
+
+    /// Nearest cell that is obstacle-free (ignores exploredCells constraint).
+    private func nearestFreeCellObstacleOnly(to cell: GridCell, maxRadius: Int = 8) -> GridCell {
+        guard dilatedCells.contains(cell) else { return cell }
+        for r in 1...maxRadius {
+            for dx in -r...r {
+                for dz in -r...r {
+                    guard abs(dx) == r || abs(dz) == r else { continue }
+                    let c = GridCell(x: cell.x + dx, z: cell.z + dz)
+                    if !dilatedCells.contains(c) { return c }
+                }
+            }
+        }
+        return cell
+    }
+
+    /// Returns the nearest passable grid cell to `cell`.
+    /// A cell is passable when it is not an obstacle AND lies in a scanned
+    /// floor area (or no floor data exists yet, in which case only the
+    /// obstacle check applies).
+    private func nearestFreeCell(to cell: GridCell, maxRadius: Int = 8) -> GridCell {
+        let isFree: (GridCell) -> Bool = { [self] c in
+            !dilatedCells.contains(c) &&
+            (exploredCells.isEmpty || exploredCells.contains(c))
+        }
+        guard !isFree(cell) else { return cell }
+        for r in 1...maxRadius {
+            for dx in -r...r {
+                for dz in -r...r {
+                    guard abs(dx) == r || abs(dz) == r else { continue }
+                    let candidate = GridCell(x: cell.x + dx, z: cell.z + dz)
+                    if isFree(candidate) { return candidate }
+                }
+            }
+        }
+        return cell   // fallback: original cell
     }
 
     func calculateRoute(
@@ -142,7 +234,8 @@ final class NavigationService {
         static func < (a: Self, b: Self) -> Bool { a.f < b.f }
     }
 
-    private func astar(from start: GridCell, to goal: GridCell) -> [GridCell] {
+    /// `exploredOnly`: when true, only routes through cells in `exploredCells`.
+    private func astar(from start: GridCell, to goal: GridCell, exploredOnly: Bool) -> [GridCell] {
         var open     = MinHeap<AStarNode>()
         var cameFrom = [GridCell: GridCell]()
         var gScore   = [GridCell: Float]()
@@ -163,6 +256,8 @@ final class NavigationService {
 
             for (nb, moveCost) in neighborCosts(of: cur.cell) {
                 guard !closed.contains(nb), !dilatedCells.contains(nb) else { continue }
+                // In explored-only mode, skip cells that haven't been scanned as floor.
+                if exploredOnly && !exploredCells.isEmpty && !exploredCells.contains(nb) { continue }
                 let tentG = (gScore[cur.cell] ?? .infinity) + moveCost
                 if tentG < (gScore[nb] ?? .infinity) {
                     cameFrom[nb] = cur.cell
@@ -243,6 +338,15 @@ final class NavigationService {
         for dx in -1...1 {
             for dz in -1...1 {
                 guard dx != 0 || dz != 0 else { continue }
+                // Prevent diagonal moves from cutting through wall corners.
+                // A diagonal step (dx,dz) is only legal when both intermediate
+                // cardinal cells are also free.
+                if dx != 0 && dz != 0 {
+                    if dilatedCells.contains(GridCell(x: c.x + dx, z: c.z)) ||
+                       dilatedCells.contains(GridCell(x: c.x, z: c.z + dz)) {
+                        continue
+                    }
+                }
                 let cost: Float = (dx != 0 && dz != 0) ? 1.414 : 1.0
                 result.append((GridCell(x: c.x + dx, z: c.z + dz), cost))
             }

@@ -125,12 +125,12 @@ final class ARCameraService: NSObject {
             lock.unlock()
 
             let thread = Thread.isMainThread ? "main" : "bg"
-            print("""
-            [FrameDebug] 2s window | thread=\(thread)
-              delegate=\(d) gateDrop=\(g) accepted=\(a) copyFail=\(cf) callbackNil=\(cn)
-              lastGateHeld=\(String(format: "%.1fms", gh*1000)) maxGateHeld=\(String(format: "%.1fms", mgh*1000))
-              avgCopy=\(String(format: "%.1fms", avgCopy))
-            """)
+//            print("""
+//            [FrameDebug] 2s window | thread=\(thread)
+//              delegate=\(d) gateDrop=\(g) accepted=\(a) copyFail=\(cf) callbackNil=\(cn)
+//              lastGateHeld=\(String(format: "%.1fms", gh*1000)) maxGateHeld=\(String(format: "%.1fms", mgh*1000))
+//              avgCopy=\(String(format: "%.1fms", avgCopy))
+//            """)
         }
     }
 
@@ -138,7 +138,7 @@ final class ARCameraService: NSObject {
 
     private var currentMeshAnchors: [UUID: ARMeshAnchor] = [:]
     private var lastMeshPublishTime: TimeInterval = 0
-    private let meshPublishInterval: TimeInterval = 0.5
+    private let meshPublishInterval: TimeInterval = 1.5
 
     override init() {
         super.init()

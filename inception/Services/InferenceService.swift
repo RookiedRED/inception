@@ -153,12 +153,12 @@ final class InferenceService {
 
                     let t2 = CACurrentMediaTime()
 
-                    print(String(
-                        format: "推論: %.1fms | 解析: %.1fms | 總計: %.1fms",
-                        (t1 - t0) * 1000,
-                        (t2 - t1) * 1000,
-                        (t2 - t0) * 1000
-                    ))
+//                    print(String(
+//                        format: "推論: %.1fms | 解析: %.1fms | 總計: %.1fms",
+//                        (t1 - t0) * 1000,
+//                        (t2 - t1) * 1000,
+//                        (t2 - t0) * 1000
+//                    ))
 
                     DispatchQueue.main.async {
                         completion(.success(InferenceResult(

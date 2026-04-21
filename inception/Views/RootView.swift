@@ -7,6 +7,7 @@
 
 import SwiftUI
 
+/// Root composition view that assembles the camera, overlays, minimap, and navigation UI.
 struct RootView: View {
     @StateObject private var viewModel = DriveViewModel()
     @State private var isMiniMapExpanded = false
@@ -126,6 +127,7 @@ struct RootView: View {
         .animation(.spring(response: 0.4, dampingFraction: 0.8), value: viewModel.navigationArrivedMessage)
     }
 
+    /// Shared minimap builder used by both compact and expanded presentations.
     private func miniMap() -> some View {
         MiniMapView(
             scene: viewModel.miniMapService.scene,
@@ -164,11 +166,13 @@ struct RootView: View {
         .contentShape(Rectangle())
     }
 
+    /// Keeps SwiftUI state and SceneKit presentation mode in sync.
     private func setMiniMapExpanded(_ isExpanded: Bool) {
         isMiniMapExpanded = isExpanded
         viewModel.setMiniMapPresentationMode(isExpanded ? .expanded : .compact)
     }
 
+    /// Closes the topmost transient UI before collapsing the minimap.
     private func dismissVisiblePopupIfNeeded() -> Bool {
         if viewModel.selectedLandmark != nil {
             viewModel.selectLandmark(id: nil)
@@ -186,16 +190,5 @@ struct RootView: View {
         }
 
         return false
-    }
-}
-
-private extension View {
-    @ViewBuilder
-    func `if`<Content: View>(_ condition: Bool, transform: (Self) -> Content) -> some View {
-        if condition {
-            transform(self)
-        } else {
-            self
-        }
     }
 }

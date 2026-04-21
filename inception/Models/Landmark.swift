@@ -8,14 +8,14 @@
 import Foundation
 import simd
 
+/// Persistent world-space marker created from repeated observations of a static object.
 struct Landmark: Identifiable {
     let id: UUID
     let className: String
-    /// World-space XZ position (Y is ignored for minimap rendering).
+    /// World-space position used by the minimap and route-planning features.
     var worldPosition: simd_float3
     var confidence: Float
     var lastSeenTimestamp: TimeInterval
-    /// How many times this landmark has been observed.
-    /// Only landmarks above a minimum threshold are shown on the map.
+    /// Number of supporting detections accumulated for this landmark.
     var observationCount: Int
 }

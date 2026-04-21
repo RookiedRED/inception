@@ -12,8 +12,10 @@ import CoreImage
 import CoreVideo
 import OnnxRuntimeBindings
 
+/// Handles image preprocessing, ONNX Runtime execution, and model-output decoding.
 final class InferenceService {
 
+    /// Stores the letterbox transform required to map detections back into source-image space.
     private struct PreprocessMapping {
         let sourceWidth: CGFloat
         let sourceHeight: CGFloat
@@ -22,22 +24,22 @@ final class InferenceService {
         let offsetY: CGFloat
     }
 
-    // MARK: - Config
+    // MARK: - Model Configuration
 
     private let confThreshold: Float = 0.25
     private let iouThreshold: Float = 0.45
     private let inputSize: Int = 640
 
-    // 若你的模型 input/output 名稱不同，改這兩個
+    /// Input/output tensor names expected by the bundled model.
     private let inputName = "images"
     private let outputName = "output0"
 
-    // MARK: - ORT
+    // MARK: - ONNX Runtime State
 
     private var session: ORTSession?
     private var ortEnv: ORTEnv?
 
-    // MARK: - Queues / Context
+    // MARK: - Queues and Render Context
 
     private let queue = DispatchQueue(label: "inference.service.queue", qos: .userInitiated)
     private let setupQueue = DispatchQueue(label: "inference.service.setup", qos: .userInitiated)
@@ -48,12 +50,12 @@ final class InferenceService {
         .outputColorSpace: CGColorSpaceCreateDeviceRGB()
     ])
 
-    // MARK: - State
+    // MARK: - Mutable State
 
     private var hasLoggedShape = false
     private var transpositionBuffer = [Float32]()
 
-    // MARK: - Reusable buffers
+    // MARK: - Reusable Buffers
 
     private var resizedPixelBuffer: CVPixelBuffer?
 
@@ -61,13 +63,13 @@ final class InferenceService {
     private var gBytes = [UInt8]()
     private var bBytes = [UInt8]()
 
-    // Single buffer — vDSP writes directly here, no intermediate inputFloats copy.
+    /// Shared input tensor backing storage reused across inference calls.
     private var inputMutableData = NSMutableData()
 
-    // Pre-allocated input ORTValue — wraps inputMutableData by reference, reused every frame.
+    /// Pre-allocated ORT tensor that points at `inputMutableData`.
     private var inputTensor: ORTValue?
 
-    // Cache the letterbox transform — recomputed only when source resolution changes.
+    /// Cached letterbox transform, recomputed only when source resolution changes.
     private var cachedSourceSize: CGSize = .zero
     private var cachedMapping: PreprocessMapping?
 
@@ -80,8 +82,9 @@ final class InferenceService {
         }
     }
 
-    // MARK: - Public
+    // MARK: - Public API
 
+    /// Runs preprocessing, model execution, and postprocessing on the inference queue.
     func run(
         pixelBuffer: CVPixelBuffer,
         completion: @escaping (Result<InferenceResult, Error>) -> Void
@@ -125,8 +128,6 @@ final class InferenceService {
                         runOptions: nil
                     )
 
-                    let t1 = CACurrentMediaTime()
-
                     guard let outputValue = outputs[self.outputName] else {
                         DispatchQueue.main.async {
                             completion(.success(InferenceResult(detections: [], inferenceMs: 0)))
@@ -142,8 +143,7 @@ final class InferenceService {
                         print("📐 \(self.outputName) shape: \(shape)")
                     }
 
-                    // tensorData() returns NSMutableData backed by ORT's raw pointer (no copy).
-                    // We pass it directly to avoid the NSMutableData→Data bridging copy.
+                    // `tensorData()` is already backed by ORT-managed storage.
                     let outputTensorData = try outputValue.tensorData()
                     let detections = self.parseDetections(
                         fromTensorData: outputTensorData,
@@ -152,13 +152,6 @@ final class InferenceService {
                     )
 
                     let t2 = CACurrentMediaTime()
-
-//                    print(String(
-//                        format: "推論: %.1fms | 解析: %.1fms | 總計: %.1fms",
-//                        (t1 - t0) * 1000,
-//                        (t2 - t1) * 1000,
-//                        (t2 - t0) * 1000
-//                    ))
 
                     DispatchQueue.main.async {
                         completion(.success(InferenceResult(
@@ -178,6 +171,7 @@ final class InferenceService {
 
     // MARK: - Setup
 
+    /// Allocates all reusable CPU-side buffers used during preprocessing.
     private func prepareReusableBuffers() {
         let planeSize = inputSize * inputSize
 
@@ -187,14 +181,14 @@ final class InferenceService {
 
         inputMutableData = NSMutableData(length: 3 * planeSize * MemoryLayout<Float32>.stride) ?? NSMutableData()
 
-        // Create ORTValue once — ORT holds a raw pointer to inputMutableData.mutableBytes,
-        // so in-place writes to the buffer are visible at inference time without re-creation.
+        // ORT holds a raw pointer to `inputMutableData.mutableBytes`, so the tensor can be reused.
         let inputShape: [NSNumber] = [1, 3, NSNumber(value: inputSize), NSNumber(value: inputSize)]
         inputTensor = try? ORTValue(tensorData: inputMutableData, elementType: .float, shape: inputShape)
 
         resizedPixelBuffer = Self.makePixelBuffer(width: inputSize, height: inputSize)
     }
 
+    /// Loads and configures the ONNX Runtime session.
     private func setupModel() {
         do {
             let env = try ORTEnv(loggingLevel: .warning)
@@ -207,12 +201,9 @@ final class InferenceService {
 
             let options = try ORTSessionOptions()
 
-            // CoreML 下不一定 thread 越多越好，先從 2 開始測
             try options.setIntraOpNumThreads(2)
 
-            // CoreML EP V2：
-            //   CPUAndNeuralEngine — 避免 GPU 參與，降低熱量；ANE 是 neural net 最省電的路徑
-            //   MLProgram — 新版 CoreML 格式，比 NeuralNetwork 有更好的 op 支援與 cache
+            // Prefer CPU + Neural Engine to reduce thermals during continuous AR usage.
             try options.appendCoreMLExecutionProvider(withOptionsV2: [
                 "MLComputeUnits": "CPUAndNeuralEngine",
                 "ModelFormat": "MLProgram"
@@ -259,7 +250,8 @@ final class InferenceService {
     }
 
     // MARK: - Preprocessing
-    // CVPixelBuffer -> Float32 NCHW [1, 3, inputSize, inputSize]
+
+    /// Converts a camera frame into normalized NCHW float input expected by the model.
 
     private func preprocessIntoReusableBuffer(_ pixelBuffer: CVPixelBuffer) -> PreprocessMapping? {
         guard let outputBuffer = resizedPixelBuffer else { return nil }
@@ -271,7 +263,7 @@ final class InferenceService {
         let sourceWidth = ciImage.extent.width
         let sourceHeight = ciImage.extent.height
 
-        // Recompute letterbox transform only when source resolution changes (e.g. orientation flip).
+        // Recompute the letterbox mapping only when the source resolution changes.
         let sourceSize = CGSize(width: sourceWidth, height: sourceHeight)
         let mapping: PreprocessMapping
         if sourceSize == cachedSourceSize, let cached = cachedMapping {
@@ -341,7 +333,7 @@ final class InferenceService {
             }
         }
 
-        // Write float data directly into inputMutableData — no intermediate copy.
+        // Write normalized floats directly into the reusable tensor backing store.
         var normalizationScale: Float = 1.0 / 255.0
         let dst = inputMutableData.mutableBytes.assumingMemoryBound(to: Float32.self)
 
@@ -357,8 +349,9 @@ final class InferenceService {
         return mapping
     }
 
-    // MARK: - Parsing
+    // MARK: - Output Parsing
 
+    /// Entrypoint for decoding raw tensor bytes into UI-facing detections.
     private func parseDetections(
         fromTensorData tensorData: NSMutableData,
         shape: [Int],
@@ -369,7 +362,7 @@ final class InferenceService {
         return parseDetections(from: ptr, shape: shape, mapping: mapping)
     }
 
-    // shape 末兩維支援 [C, N] 與 [N, C]
+    /// Supports both `[C, N]` and `[N, C]` layouts emitted by YOLO-family models.
     private func parseDetections(
         from ptr: UnsafePointer<Float32>,
         shape: [Int],
@@ -441,6 +434,7 @@ final class InferenceService {
         return nonMaxSuppression(detections)
     }
 
+    /// Parses a contiguous `[anchor][channel]` tensor layout into `Detection` values.
     private func parseDetectionsContiguous(
         from tPtr: UnsafePointer<Float32>,
         numChannels: Int,
@@ -479,6 +473,7 @@ final class InferenceService {
         }
     }
 
+    /// Maps one decoded YOLO box from model space back into normalized image space.
     private func appendDetection(
         _ cx: Float,
         _ cy: Float,
@@ -523,8 +518,9 @@ final class InferenceService {
         )
     }
 
-    // MARK: - NMS
+    // MARK: - Non-Max Suppression
 
+    /// Removes highly overlapping detections while keeping the highest-confidence box.
     private func nonMaxSuppression(_ dets: [Detection]) -> [Detection] {
         guard !dets.isEmpty else { return [] }
 
@@ -548,6 +544,7 @@ final class InferenceService {
         return kept
     }
 
+    /// Computes intersection-over-union for suppression decisions.
     private func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
         let inter = a.intersection(b)
         if inter.isNull || inter.isEmpty { return 0 }
@@ -560,15 +557,17 @@ final class InferenceService {
 
 }
 
-// MARK: - Result
+// MARK: - Result Types
 
+/// Result returned to the view model after a single inference pass.
 struct InferenceResult {
     let detections: [Detection]
     let inferenceMs: Double
 }
 
-// MARK: - Error
+// MARK: - Errors
 
+/// Errors surfaced when the inference pipeline is not ready to execute.
 enum InferenceError: LocalizedError {
     case sessionNotReady
     case serviceDeallocated

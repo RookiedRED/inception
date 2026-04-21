@@ -29,6 +29,7 @@ struct TrackedObject: Identifiable {
 }
 
 extension TrackedObject {
+    /// Overlay/minimap label prioritizing depth when scene depth is available.
     var trackLabel: String {
         if let d = depth {
             return "#\(id) \(detection.className) \(String(format: "%.1fm", d))"

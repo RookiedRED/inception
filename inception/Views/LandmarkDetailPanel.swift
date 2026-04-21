@@ -5,6 +5,7 @@
 
 import SwiftUI
 
+/// Side panel shown after the user selects a landmark on the minimap.
 struct LandmarkCalloutView: View {
     let landmark: Landmark
     let distanceMeters: Float
@@ -13,7 +14,6 @@ struct LandmarkCalloutView: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        
         HStack(spacing: 12) {
             VStack(spacing: 12) {
                 Text("Navigate to the \(landmark.className.lowercased())")
@@ -23,10 +23,11 @@ struct LandmarkCalloutView: View {
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(.white)
                     .shadow(color: .black.opacity(0.4), radius: 4, x: 0, y: 2)
-            }.frame(maxWidth: .infinity)
-            
+            }
+            .frame(maxWidth: .infinity)
+
             Spacer()
-            
+
             VStack(spacing: 16) {
                 if isLoading {
                     ProgressView()
@@ -44,10 +45,9 @@ struct LandmarkCalloutView: View {
                             .background(Color(red: 0.16, green: 0.53, blue: 0.98))
                             .foregroundStyle(.white)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
-                            
                     }
                 }
-                
+
                 Button(action: onDismiss) {
                     Image(systemName: "xmark")
                         .font(.system(size: 12, weight: .bold))
@@ -77,12 +77,14 @@ struct LandmarkCalloutView: View {
         .shadow(color: .black.opacity(0.28), radius: 18, y: 10)
     }
 
+    /// Distance formatting prepared for future UI display variants.
     private var distanceString: String {
         distanceMeters < 10
             ? String(format: "%.1f M", distanceMeters)
             : String(format: "%.0f M", distanceMeters)
     }
 
+    /// Maps detected classes to an SF Symbol used across navigation UI.
     private func symbolName(for className: String) -> String {
         switch className {
         case "person": return "figure.walk"
@@ -119,6 +121,7 @@ struct LandmarkCalloutView: View {
     }
 }
 
+/// Navigation status panel shown while a route is active.
 struct NavigationSidePromptView: View {
     let distanceMeters: Float?
     let isUpdating: Bool
@@ -192,6 +195,7 @@ struct NavigationSidePromptView: View {
     }
 }
 
+/// Temporary confirmation banner shown after reaching the destination.
 struct ArrivedBannerView: View {
     var body: some View {
         HStack(spacing: 10) {
@@ -214,6 +218,7 @@ struct ArrivedBannerView: View {
     }
 }
 
+/// Small triangular pointer used by the landmark callout panel.
 private struct CalloutPointer: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()

@@ -3,6 +3,7 @@ import CoreImage
 import CoreVideo
 import MetalKit
 
+/// SwiftUI wrapper around the Metal-based live camera preview surface.
 struct CameraPreviewView: UIViewRepresentable {
     let source: CameraPreviewSource
 
@@ -16,10 +17,10 @@ struct CameraPreviewView: UIViewRepresentable {
     func updateUIView(_ uiView: PreviewMetalView, context: Context) {
         source.attach(uiView)
     }
-
 }
 
 @MainActor
+/// Bridges the latest camera frame from the view model into the preview view.
 final class CameraPreviewSource {
     private weak var view: PreviewMetalView?
     private var latestPixelBuffer: CVPixelBuffer?
@@ -37,6 +38,7 @@ final class CameraPreviewSource {
     }
 }
 
+/// Renders camera frames with Core Image directly into a Metal drawable.
 final class PreviewMetalView: MTKView {
     private var pixelBuffer: CVPixelBuffer?
 
@@ -73,7 +75,7 @@ final class PreviewMetalView: MTKView {
               let ciContext,
               let currentDrawable else { return }
 
-        // Match the overlay's aspect-fill geometry so boxes and preview stay aligned.
+        // Mirror the overlay's aspect-fill transform so 2D boxes stay registered.
         let image = CIImage(cvPixelBuffer: pixelBuffer)
         let sourceRect = image.extent
         let targetRect = CGRect(origin: .zero, size: drawableSize)

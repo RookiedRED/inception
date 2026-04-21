@@ -12,6 +12,7 @@ import CoreVideo
 import simd
 
 @MainActor
+/// Coordinates the AR session, inference pipeline, minimap state, and navigation UI.
 final class DriveViewModel: ObservableObject {
 
     // MARK: - Services
@@ -22,11 +23,11 @@ final class DriveViewModel: ObservableObject {
     let landmarkStore = LandmarkStore()
     let navigationService = NavigationService()
 
-    // MARK: - Session (for non-rendering uses like MiniMap)
+    // MARK: - Session Access
 
     var arSession: ARSession { cameraService.session }
 
-    // MARK: - Published UI State
+    // MARK: - Published State
 
     @Published var trackedObjects: [TrackedObject] = []
     @Published var inferenceMs: Double = 0
@@ -59,7 +60,7 @@ final class DriveViewModel: ObservableObject {
     private let routeRefreshInterval: CFTimeInterval = 0.6
     private let routeRefreshDistanceThreshold: Float = 0.3
 
-    // MARK: - Internal State
+    // MARK: - Internal Pipeline State
 
     private var subscriptions = Set<AnyCancellable>()
     private var frameCount = 0
@@ -69,23 +70,21 @@ final class DriveViewModel: ObservableObject {
     private var latestTrackedObjectsTimestamp: TimeInterval = 0
     private var lastInferenceTime: CFTimeInterval = 0
     private var lastMiniMapCameraUpdateTime: CFTimeInterval = 0
-    /// EWMA of recent inference latency (ms). Seed at 100ms as a safe starting estimate.
+    /// EWMA of recent inference latency used to adapt the inference cadence.
     private var ewmaInferenceMs: Double = 100.0
-    private let ewmaAlpha: Double = 0.15  // smoothing factor; lower = more stable
+    private let ewmaAlpha: Double = 0.15
     private let miniMapCameraUpdateInterval: CFTimeInterval = 1.0 / 30.0
 
-    /// Adaptive minimum interval targeting 65% Neural Engine duty cycle.
-    /// If inference is fast (70ms) → ~108ms interval (≈9fps).
-    /// If throttled (200ms) → ~308ms interval (≈3fps) — backs off automatically.
+    /// Adaptive minimum interval targeting a steady continuous-inference duty cycle.
     private var adaptiveMinInterval: CFTimeInterval {
         let targetMs = ewmaInferenceMs / 0.65
-        // Clamp between 6fps (heavy scene) and 15fps (fast device)
         return max(1.0 / 15.0, min(1.0 / 6.0, targetMs / 1000.0))
     }
 
 
     // MARK: - Lifecycle
 
+    /// Starts the AR session and lazily wires up one-time subscriptions.
     func start() {
         if !didSetupPipeline {
             setupPipeline()
@@ -109,6 +108,7 @@ final class DriveViewModel: ObservableObject {
 
     // MARK: - Pipeline Setup
 
+    /// Connects camera frames and mesh updates to the rest of the app pipeline.
     private func setupPipeline() {
         let cameraService = self.cameraService
         cameraService.onFrame = { [weak self, cameraService] pixelBuffer, context in
@@ -133,12 +133,13 @@ final class DriveViewModel: ObservableObject {
             .store(in: &subscriptions)
     }
 
-    // MARK: - Frame Handling
+    // MARK: - Frame Processing
 
+    /// Handles one copied AR frame: preview first, inference opportunistically.
     private func handleARFrame(_ pixelBuffer: CVPixelBuffer, context: ARFrameContext) {
         let t0 = CACurrentMediaTime()
 
-        // Keep the preview on the freshest frame available, even while inference is busy.
+        // Keep the preview responsive even when inference is temporarily backlogged.
         Task { @MainActor in
             guard context.timestamp >= self.latestCameraTimestamp else { return }
             self.latestCameraTimestamp = context.timestamp
@@ -157,8 +158,7 @@ final class DriveViewModel: ObservableObject {
         if shouldInfer {
             isInferring = true
             lastInferenceTime = now
-            // Release the AR frame gate immediately so camera preview stays responsive
-            // while inference runs on its private queue.
+            // Release the frame gate immediately so ARKit can continue feeding preview frames.
             cameraService.endProcessing()
 
             let dispatchTime = CACurrentMediaTime()
@@ -171,18 +171,14 @@ final class DriveViewModel: ObservableObject {
                 let inferLatency = (CACurrentMediaTime() - dispatchTime) * 1000
                 defer {
                     self.isInferring = false
-//                    print(String(format: "[FrameDebug] INFER: latency=%.1fms thread=%@",
-//                                 inferLatency, Thread.isMainThread ? "main" : "bg"))
+                    _ = inferLatency
                 }
 
                 switch result {
                 case .success(let output):
-                    // Update EWMA so adaptiveMinInterval adjusts on next frame.
                     self.ewmaInferenceMs = self.ewmaAlpha * output.inferenceMs
                         + (1.0 - self.ewmaAlpha) * self.ewmaInferenceMs
 
-                    // Completion already runs on main thread — compute objects here directly.
-                    // makeDisplayObjects is O(detections) with depth lookups, typically <1ms.
                     let objects = Self.makeDisplayObjects(
                         from: output.detections,
                         context: context,
@@ -195,8 +191,6 @@ final class DriveViewModel: ObservableObject {
                     self.trackedObjects = objects
                     self.detectionCount = objects.count
 
-                    // Save static objects as persistent landmarks.
-                    // Dynamic objects (people, vehicles, animals) are filtered out in LandmarkStore.
                     self.landmarkStore.update(with: objects)
                     self.miniMapService.updateLandmarks(self.landmarkStore.all)
 
@@ -208,15 +202,15 @@ final class DriveViewModel: ObservableObject {
         } else {
             cameraService.endProcessing()
 
-            // Only print occasionally to avoid log spam
             if frameCount % 30 == 0 {
                 let totalMs = (CACurrentMediaTime() - t0) * 1000
-//                print(String(format: "[FrameDebug] PREVIEW: total=%.1fms", totalMs))
+                _ = totalMs
             }
         }
     }
 
-    private nonisolated static func makeDisplayObjects(
+    /// Converts raw detections into display models with optional depth/world-position estimates.
+    private static func makeDisplayObjects(
         from detections: [Detection],
         context: ARFrameContext,
         timestamp: TimeInterval
@@ -237,7 +231,8 @@ final class DriveViewModel: ObservableObject {
         }
     }
 
-    private nonisolated static func estimateWorldPosition(
+    /// Estimates world-space position from the detection center and scene-depth data.
+    private static func estimateWorldPosition(
         for detection: Detection,
         context: ARFrameContext
     ) -> (worldPosition: simd_float3?, depth: Float?) {
@@ -284,7 +279,8 @@ final class DriveViewModel: ObservableObject {
         return (simd_float3(worldPoint.x, worldPoint.y, worldPoint.z), sampledDepth)
     }
 
-    private nonisolated static func sampledDepth(
+    /// Samples a median depth value near the requested pixel to reduce single-pixel noise.
+    private static func sampledDepth(
         around point: CGPoint,
         sceneDepth: ARFrameContext.SceneDepthData
     ) -> Float? {
@@ -318,6 +314,7 @@ final class DriveViewModel: ObservableObject {
         return candidates[candidates.count / 2]
     }
 
+    /// Applies the latest camera transform to the minimap scene.
     private func updateMiniMapCamera(with context: ARFrameContext) {
         miniMapService.updateCamera(
             transform: context.cameraTransform,
@@ -325,6 +322,7 @@ final class DriveViewModel: ObservableObject {
         )
     }
 
+    /// Throttles minimap camera updates to a stable display cadence.
     private func updateMiniMapCameraIfNeeded(with context: ARFrameContext) {
         let now = CACurrentMediaTime()
         guard now - lastMiniMapCameraUpdateTime >= miniMapCameraUpdateInterval else { return }
@@ -375,7 +373,7 @@ final class DriveViewModel: ObservableObject {
         return simd_distance(SIMD2<Float>(u.x, u.z), SIMD2<Float>(l.x, l.z))
     }
 
-    /// Build an occupancy map and start navigating to `landmark`.
+    /// Builds a route to the selected landmark and transitions the UI into navigation mode.
     func startNavigation(to landmark: Landmark) {
         let anchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
         let start = miniMapService.userPosition
@@ -408,13 +406,12 @@ final class DriveViewModel: ObservableObject {
 
     // MARK: - Navigation Progress
 
+    /// Advances the active route and triggers periodic replanning while the user moves.
     private func updateNavigationProgress() {
         guard isNavigating, !navigationArrivedMessage else { return }
 
         let user = miniMapService.userPosition
 
-        // Always try to refresh; this also retries when route is empty (no path
-        // was found last time — keep polling as the scene mesh improves).
         maybeRefreshNavigationRoute(from: user)
 
         guard !navigationRoute.isEmpty else { return }
@@ -426,13 +423,13 @@ final class DriveViewModel: ObservableObject {
             updateDisplayedNavigationRoute(from: user)
         }
 
-        // Check arrival at final destination
         guard let last = navigationRoute.last else { return }
         if simd_distance(userFlat, SIMD2<Float>(last.x, last.z)) < 1.0 {
             handleArrival()
         }
     }
 
+    /// Finalizes navigation UI state when the destination has been reached.
     private func handleArrival() {
         invalidatePendingNavigationRequest()
         isNavigating = false
@@ -446,6 +443,7 @@ final class DriveViewModel: ObservableObject {
         }
     }
 
+    /// Commits a newly computed route to the published view state and minimap.
     private func applyNavigationRoute(_ route: [simd_float3], targetLandmarkID: UUID, from start: simd_float3) {
         navigationRoute = route
         isNavigating = true
@@ -456,15 +454,16 @@ final class DriveViewModel: ObservableObject {
         lastRouteRefreshPosition = start
         lastRouteRefreshTime = CACurrentMediaTime()
         updateDisplayedNavigationRoute(from: start)
-        // Refresh occupancy grid debug overlay so the user can inspect explored/obstacle cells.
         miniMapService.updateOccupancyGrid(navigationService.occupancySnapshot())
     }
 
+    /// Invalidates any in-flight asynchronous route calculation.
     private func invalidatePendingNavigationRequest() {
         navigationRequestID = UUID()
         isCalculatingNavigation = false
     }
 
+    /// Advances to the next waypoint once the user is close enough to the current one.
     private func advanceWaypointIndex(for userFlat: SIMD2<Float>) -> Bool {
         var advanced = false
         while navigationWaypointIndex < navigationRoute.count - 1 {
@@ -479,6 +478,7 @@ final class DriveViewModel: ObservableObject {
         return advanced
     }
 
+    /// Replans the current route when enough time has passed and the user has moved.
     private func maybeRefreshNavigationRoute(from user: simd_float3) {
         guard !isCalculatingNavigation,
               let targetID = navigationTargetID,
@@ -493,8 +493,6 @@ final class DriveViewModel: ObservableObject {
             SIMD2<Float>(user.x, user.z),
             SIMD2<Float>(lastRouteRefreshPosition?.x ?? user.x, lastRouteRefreshPosition?.z ?? user.z)
         )
-        // When no valid path exists yet, retry on timer alone (no movement needed).
-        // Once a route is established, require the user to move before recalculating.
         guard movedDistance >= routeRefreshDistanceThreshold || navigationRoute.isEmpty else { return }
 
         let anchors = arSession.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
@@ -510,6 +508,7 @@ final class DriveViewModel: ObservableObject {
         }
     }
 
+    /// Trims the route to only the remaining waypoints that still matter to the user.
     private func updateDisplayedNavigationRoute(from user: simd_float3) {
         guard isNavigating, !navigationRoute.isEmpty else {
             miniMapService.updateNavigationRoute([], targetLandmarkID: navigationTargetID)

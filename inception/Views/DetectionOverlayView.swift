@@ -7,6 +7,7 @@
 
 import SwiftUI
 
+/// Draws bounding boxes and labels over the live camera preview.
 struct DetectionOverlayView: View {
     let trackedObjects: [TrackedObject]
     let orientation: AppOrientation
@@ -54,6 +55,7 @@ struct DetectionOverlayView: View {
         .allowsHitTesting(false)
     }
 
+    /// Converts normalized detection boxes into the same aspect-fill space used by the preview.
     private func displayRect(for bbox: CGRect, viewSize: CGSize, imageResolution: CGSize) -> CGRect {
         guard imageResolution.width > 0, imageResolution.height > 0 else { return .null }
 

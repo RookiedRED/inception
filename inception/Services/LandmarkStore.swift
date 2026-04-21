@@ -10,6 +10,7 @@ import Foundation
 import simd
 
 @MainActor
+/// Stores and merges persistent static landmarks inferred from repeated detections.
 final class LandmarkStore {
 
     // MARK: - Config
@@ -42,7 +43,7 @@ final class LandmarkStore {
 
     private var landmarks: [UUID: Landmark] = [:]
 
-    /// Only returns landmarks that have been confirmed by enough observations.
+    /// Returns only landmarks that have been observed often enough to be considered stable.
     var all: [Landmark] {
         landmarks.values.filter { $0.observationCount >= minimumObservations }
     }
@@ -87,15 +88,13 @@ final class LandmarkStore {
         landmarks.removeAll()
     }
 
-    // MARK: - Nearest-neighbour lookup
+    // MARK: - Matching Helpers
 
-    /// Returns the ID of the CLOSEST existing landmark of the same class within mergeRadius.
-    /// Using the closest (not arbitrary first) reduces false non-merges when multiple
-    /// candidates exist at different distances.
+    /// Returns the nearest existing landmark of the same class within the merge radius.
     private func closestLandmarkID(to position: simd_float3, className: String) -> UUID? {
         let flat = SIMD2<Float>(position.x, position.z)
         var bestID: UUID?
-        var bestDist: Float = mergeRadius  // only accept within radius
+        var bestDist: Float = mergeRadius
 
         for (id, lm) in landmarks {
             guard lm.className == className else { continue }
@@ -111,10 +110,7 @@ final class LandmarkStore {
 
     // MARK: - Consolidation
 
-    /// After each update batch, sweep all same-class landmark pairs and merge any that
-    /// have drifted within mergeRadius of each other.
-    /// This handles the edge case where two separately-created landmarks later converge
-    /// as their EWMA positions are updated toward the true object location.
+    /// Merges same-class landmarks that drift close enough to represent the same object.
     private func consolidate() {
         var ids = Array(landmarks.keys)
         var i = 0
@@ -128,7 +124,6 @@ final class LandmarkStore {
 
                 let bFlat = SIMD2<Float>(b.worldPosition.x, b.worldPosition.z)
                 if simd_distance(aFlat, bFlat) < mergeRadius {
-                    // Merge b into a: average position, take best confidence and count
                     var merged = a
                     merged.worldPosition = (a.worldPosition + b.worldPosition) * 0.5
                     merged.confidence = max(a.confidence, b.confidence)
@@ -138,7 +133,6 @@ final class LandmarkStore {
 
                     landmarks.removeValue(forKey: ids[j])
                     ids.remove(at: j)
-                    // Don't increment j — next element shifted into this index
                 } else {
                     j += 1
                 }

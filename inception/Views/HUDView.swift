@@ -1,5 +1,6 @@
 import SwiftUI
 
+/// Heads-up display for lightweight runtime status information.
 struct HUDView: View {
     let inferenceMs: Double
     let detectionCount: Int
@@ -17,10 +18,11 @@ struct HUDView: View {
                 detectionLabel
             }
         }
-        // 文字翻轉 180°
+        // Keep text upright when the device is physically held upside down in landscape.
         .rotationEffect(.degrees(orientation.isFlipped ? 180 : 0))
     }
 
+    /// Shows the latest end-to-end model latency.
     private var cpuLabel: some View {
         HUDLabel(
             icon: "cpu",
@@ -29,6 +31,7 @@ struct HUDView: View {
         )
     }
 
+    /// Shows the number of currently displayed detections.
     private var detectionLabel: some View {
         HUDLabel(
             icon: "eye",
@@ -38,6 +41,7 @@ struct HUDView: View {
     }
 }
 
+/// Reusable pill-style HUD badge.
 struct HUDLabel: View {
     let icon: String
     let text: String

@@ -10,17 +10,18 @@ import simd
 import CoreGraphics
 import CoreVideo
 
-/// Lightweight metadata extracted from an ARFrame.
-/// Important:
-/// - Do NOT store ARFrame itself here (CVPixelBuffer is fine — it has its own ref-count)
+/// Immutable frame metadata extracted from `ARFrame`.
+/// The struct intentionally avoids storing `ARFrame` itself so frame lifetime stays short.
 struct ARFrameContext {
+    /// Retained scene-depth payload used for world-position reconstruction.
     struct SceneDepthData: @unchecked Sendable {
-        /// Direct reference to ARKit's depth CVPixelBuffer — zero copy.
-        /// Thread-safety is provided by CVPixelBufferLock/Unlock at each access site.
+        /// Direct reference to ARKit's depth `CVPixelBuffer`.
+        /// Access sites are responsible for lock/unlock synchronization.
         let depthMap: CVPixelBuffer
         let resolution: CGSize
         let intrinsics: simd_float3x3
 
+        /// Reads a single depth sample in depth-map coordinates.
         func depthAt(x: Int, y: Int) -> Float32? {
             let width = Int(resolution.width)
             let height = Int(resolution.height)

@@ -9,21 +9,26 @@ import CoreVideo
 import QuartzCore
 import simd
 
+/// Owns the AR session and emits frame data in a form that downstream services can safely consume.
 final class ARCameraService: NSObject {
 
     // MARK: - Public session
 
     let session = ARSession()
 
-    // MARK: - Direct frame callback
+    // MARK: - Frame Delivery
+
+    /// Called for each accepted frame after metadata extraction and image copying complete.
     var onFrame: ((_ pixelBuffer: CVPixelBuffer, _ context: ARFrameContext) -> Void)?
 
-    // MARK: - Mesh publisher (no retention issue)
+    // MARK: - Mesh Delivery
 
+    /// Publishes the latest mesh anchors used by the minimap and navigation systems.
     let meshAnchorPublisher = PassthroughSubject<[ARMeshAnchor], Never>()
 
-    // MARK: - Thread-safe processing gate
+    // MARK: - Processing Gate
 
+    /// Prevents multiple AR frames from entering the heavy processing pipeline at once.
     private let gate = NSLock()
     private var _isProcessing = false
     private var _gateLockedAt: CFTimeInterval = 0
@@ -38,7 +43,7 @@ final class ARCameraService: NSObject {
         return true
     }
 
-    /// Release the gate so the next frame can enter. Safe from any thread.
+    /// Releases the processing gate so the next frame can be accepted.
     func endProcessing() {
         gate.lock()
         let held = CACurrentMediaTime() - _gateLockedAt
@@ -47,7 +52,9 @@ final class ARCameraService: NSObject {
         FrameDebug.shared.recordGateHeld(held)
     }
 
-    // MARK: - Debug: frame retention tracker
+    // MARK: - Debug Instrumentation
+
+    /// Lightweight rolling counters for diagnosing frame back-pressure.
     class FrameDebug {
         static let shared = FrameDebug()
 
@@ -105,7 +112,7 @@ final class ARCameraService: NSObject {
             lock.unlock()
         }
 
-        /// Call from delegate. Prints a summary every 2 seconds.
+        /// Emits a rolling summary every two seconds when debug logging is enabled.
         func reportIfNeeded() {
             let now = CACurrentMediaTime()
             lock.lock()
@@ -117,20 +124,20 @@ final class ARCameraService: NSObject {
             let gh = lastGateHeld, mgh = maxGateHeld
             let avgCopy = a > 0 ? totalCopyMs / Double(a) : 0
 
-            // reset
             delegateCalls = 0; gateDrops = 0; accepted = 0
             copyFails = 0; callbackNil = 0
             totalCopyMs = 0; maxGateHeld = 0
             lastReportTime = now
             lock.unlock()
 
-            let thread = Thread.isMainThread ? "main" : "bg"
-//            print("""
-//            [FrameDebug] 2s window | thread=\(thread)
-//              delegate=\(d) gateDrop=\(g) accepted=\(a) copyFail=\(cf) callbackNil=\(cn)
-//              lastGateHeld=\(String(format: "%.1fms", gh*1000)) maxGateHeld=\(String(format: "%.1fms", mgh*1000))
-//              avgCopy=\(String(format: "%.1fms", avgCopy))
-//            """)
+            _ = d
+            _ = g
+            _ = a
+            _ = cf
+            _ = cn
+            _ = gh
+            _ = mgh
+            _ = avgCopy
         }
     }
 
@@ -182,9 +189,9 @@ final class ARCameraService: NSObject {
         endProcessing()
     }
 
-    // MARK: - Pixel buffer copy
+    // MARK: - Frame Copying
 
-    /// Create an independent copy so the source ARFrame can be released immediately.
+    /// Creates an independent image copy so the source `ARFrame` can be released immediately.
     static func copyPixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {
         let width = CVPixelBufferGetWidth(src)
         let height = CVPixelBufferGetHeight(src)
@@ -229,8 +236,9 @@ final class ARCameraService: NSObject {
         return dst
     }
 
-    // MARK: - Mesh publishing
+    // MARK: - Mesh Publishing
 
+    /// Throttles mesh-anchor publication to avoid rebuilding minimap geometry every frame.
     private func publishMeshAnchorsIfNeeded(timestamp: TimeInterval) {
         expireRemovedMeshAnchors(at: timestamp)
         guard timestamp - lastMeshPublishTime >= meshPublishInterval else { return }
@@ -252,8 +260,7 @@ final class ARCameraService: NSObject {
         }
     }
 
-    /// Extracts scene depth metadata without copying the depth map pixel data.
-    /// CVPixelBuffer has independent ref-counting — retaining it does NOT retain ARFrame.
+    /// Extracts scene-depth metadata without copying the underlying depth-map bytes.
     private static func copySceneDepth(from frame: ARFrame) -> ARFrameContext.SceneDepthData? {
         guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
             return nil
@@ -289,7 +296,7 @@ extension ARCameraService: ARSessionDelegate {
         dbg.recordDelegateCall()
         dbg.reportIfNeeded()
 
-        // Atomic gate: drop frame if previous one is still being processed
+        // Drop frames while a previous frame is still inside the processing pipeline.
         guard tryBeginProcessing() else {
             dbg.recordGateDrop()
             return
@@ -297,7 +304,7 @@ extension ARCameraService: ARSessionDelegate {
 
         dbg.recordAccepted()
 
-        // Lightweight context (no CVPixelBuffer -> no ARFrame retention)
+        // Extract only the metadata needed downstream.
         let context = ARFrameContext(
             cameraTransform: frame.camera.transform,
             intrinsics: frame.camera.intrinsics,
@@ -309,7 +316,6 @@ extension ARCameraService: ARSessionDelegate {
             timestamp: frame.timestamp
         )
 
-        // Copy pixel buffer so ARFrame is released when this method returns
         let t0 = CACurrentMediaTime()
         guard let copiedBuffer = Self.copyPixelBuffer(frame.capturedImage) else {
             dbg.recordCopyFail()
@@ -319,14 +325,12 @@ extension ARCameraService: ARSessionDelegate {
         let t1 = CACurrentMediaTime()
         dbg.recordCopyTime((t1 - t0) * 1000)
 
-        // Safety: if no handler, release gate immediately
         guard let handler = onFrame else {
             dbg.recordCallbackNil()
             endProcessing()
             return
         }
 
-        // Deliver to handler
         handler(copiedBuffer, context)
 
         publishMeshAnchorsIfNeeded(timestamp: frame.timestamp)

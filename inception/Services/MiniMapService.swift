@@ -12,18 +12,20 @@ import simd
 import UIKit
 
 @MainActor
+/// Builds and maintains the SceneKit minimap used for environment, object, and route visualization.
 final class MiniMapService {
 
+    /// Defines the two supported minimap presentation styles.
     enum PresentationMode: Equatable {
         case compact
         case expanded
     }
 
-    // MARK: - Public scene
+    // MARK: - Scene Root
 
     let scene: SCNScene = SCNScene()
 
-    // MARK: - Scene graph
+    // MARK: - Scene Graph
 
     /// Screen-space pan root used only for expanded minimap navigation.
     private let panRootNode = SCNNode()
@@ -48,7 +50,7 @@ final class MiniMapService {
     private let cameraNode = SCNNode()
     private let lightNode = SCNNode()
 
-    // MARK: - Cached nodes
+    // MARK: - Cached Nodes
 
     private var objectNodes: [Int: SCNNode] = [:]
     private var meshNodes: [UUID: SCNNode] = [:]
@@ -63,7 +65,7 @@ final class MiniMapService {
     private let landmarksRootNode = SCNNode()
     private var selectedLandmarkID: UUID?
 
-    // MARK: - State
+    // MARK: - Runtime State
 
     private var lastUserPosition = simd_float3.zero
     private var lastYaw: Float = 0
@@ -78,7 +80,7 @@ final class MiniMapService {
     private var expandedZoomScale: Double = 1.0
     private var expandedPanOffset = SIMD2<Float>(repeating: 0)
 
-    // MARK: - Config
+    // MARK: - Rendering Configuration
 
     /// If a face normal is too close to world up/down, we treat it as a horizontal surface.
     /// Raising this value keeps more slanted surfaces; lowering removes more near-horizontal faces.
@@ -92,7 +94,7 @@ final class MiniMapService {
     private let minimumExpandedZoomScale: Double = 0.55
     private let maximumExpandedZoomScale: Double = 2.4
 
-    // MARK: - Init
+    // MARK: - Initialization
 
     init() {
         scene.rootNode.addChildNode(panRootNode)
@@ -120,7 +122,7 @@ final class MiniMapService {
         setupLight()
     }
 
-    // MARK: - Setup
+    // MARK: - Scene Setup
 
     private func setupScene() {
         scene.background.contents = UIColor(white: 0.96, alpha: 0.96)
@@ -140,38 +142,29 @@ final class MiniMapService {
             emission: .clear
         )
 
-        // 白色外框：高一點
+        // White ring surrounding the user marker.
         let outerRing = SCNTube(innerRadius: 0.138, outerRadius: 0.18, height: 0.020)
         outerRing.radialSegmentCount = 64
         outerRing.materials = Array(repeating: whiteMaterial, count: 3)
         let outerNode = SCNNode(geometry: outerRing)
         outerNode.position = SCNVector3(0, 0.010, 0)
 
-        // 藍色底：略低一點
+        // Blue base disc beneath the directional arrow.
         let inner = SCNCylinder(radius: 0.138, height: 0.012)
         inner.radialSegmentCount = 64
         inner.materials = Array(repeating: blueMaterial, count: 3)
         let innerNode = SCNNode(geometry: inner)
         innerNode.position = SCNVector3(0, 0.006, 0)
 
-        // Apple 風格箭頭：中後段內縮
+        // Directional arrow indicating the user's forward heading.
         let arrowPath = UIBezierPath()
-        
-        // top tip
-        arrowPath.move(to: CGPoint(x: 0.0, y: 0.102))
-        
-        // right shoulder
-        arrowPath.addLine(to: CGPoint(x: 0.084, y: -0.082))
-        
-        // mid center
-        arrowPath.addLine(to: CGPoint(x: 0.00, y: -0.004))
-        
-        // left shoulder
-        arrowPath.addLine(to: CGPoint(x: -0.084, y: -0.082))
 
+        arrowPath.move(to: CGPoint(x: 0.0, y: 0.102))
+        arrowPath.addLine(to: CGPoint(x: 0.084, y: -0.082))
+        arrowPath.addLine(to: CGPoint(x: 0.00, y: -0.004))
+        arrowPath.addLine(to: CGPoint(x: -0.084, y: -0.082))
         arrowPath.close()
 
-        // 箭頭厚度拉高，接近白框高度
         let arrow = SCNShape(path: arrowPath, extrusionDepth: 0.020)
         arrow.chamferRadius = 0.0018
         arrow.materials = [whiteMaterial]
@@ -179,7 +172,6 @@ final class MiniMapService {
         let arrowNode = SCNNode(geometry: arrow)
         arrowNode.eulerAngles.x = -.pi / 2
 
-        // 箭頭底部貼近藍底上方，但整體高度和白框接近
         arrowNode.position = SCNVector3(0, 0.0105, 0)
 
         userMarkerNode.addChildNode(outerNode)
@@ -220,8 +212,7 @@ final class MiniMapService {
 
     // MARK: - Public API
 
-    /// User always stays centered in minimap.
-    /// Map rotates with user yaw.
+    /// Keeps the user centered while the world rotates to match heading.
     func updateCamera(transform: simd_float4x4, orientation: AppOrientation) {
         let position = simd_float3(
             transform.columns.3.x,
@@ -231,7 +222,6 @@ final class MiniMapService {
 
         let rawYaw = yawFromTransform(transform)
 
-        // Your confirmed correct landscape compensation
         let landscapeOffset: Float = .pi
         let flippedOffset: Float = orientation.isFlipped ? .pi : 0
         let targetYaw = rawYaw + landscapeOffset + flippedOffset
@@ -245,20 +235,18 @@ final class MiniMapService {
             hasSmoothedCameraState = true
         }
 
-        // User always fixed at minimap center
         userMarkerNode.position = SCNVector3(0, 0.08, 0)
         headingNode.position = SCNVector3(0, 0.08, 0)
         headingNode.eulerAngles = SCNVector3Zero
 
-        // Translate world so user is centered
         translationRootNode.position = SCNVector3(-lastUserPosition.x, 0, -lastUserPosition.z)
 
-        // Rotate map so minimap top = phone facing direction
         rotationRootNode.eulerAngles = SCNVector3(0, -lastYaw, 0)
 
         updateMiniMapCamera()
     }
 
+    /// Updates live tracked-object markers in the world layer of the minimap.
     func updateTrackedObjects(_ objects: [TrackedObject]) {
         let visibleIds = Set(objects.map(\.id))
 
@@ -275,7 +263,6 @@ final class MiniMapService {
             }
             objectNodes[object.id] = node
 
-            // Keep object in world coordinates; relative transform is handled by root nodes
             node.position = SCNVector3(world.x, 0.12, world.z)
 
             if node.parent !== objectsRootNode {
@@ -289,8 +276,7 @@ final class MiniMapService {
         }
     }
 
-    /// Updates persistent landmark pins on the minimap.
-    /// Landmarks remain visible even when the camera moves away.
+    /// Updates persistent landmark pins that remain visible across frames.
     func updateLandmarks(_ landmarks: [Landmark]) {
         let currentIds = Set(landmarks.map(\.id))
 
@@ -317,6 +303,7 @@ final class MiniMapService {
         }
     }
 
+    /// Switches between compact and expanded camera framing.
     func setPresentationMode(_ mode: PresentationMode) {
         guard presentationMode != mode else { return }
         presentationMode = mode
@@ -326,6 +313,7 @@ final class MiniMapService {
         updateMiniMapCamera()
     }
 
+    /// Applies zoom changes used only in expanded minimap mode.
     func setExpandedZoomScale(_ scale: Double) {
         let clampedScale = min(max(scale, minimumExpandedZoomScale), maximumExpandedZoomScale)
         guard abs(clampedScale - expandedZoomScale) > 0.001 else { return }
@@ -335,6 +323,7 @@ final class MiniMapService {
         updateMiniMapCamera()
     }
 
+    /// Pans the expanded minimap by converting screen translation into world translation.
     func panExpandedMap(byScreenTranslation translation: CGPoint, viewportSize: CGSize) {
         guard presentationMode == .expanded else { return }
         guard viewportSize.width > 0, viewportSize.height > 0 else { return }
@@ -350,6 +339,7 @@ final class MiniMapService {
         updateMiniMapCamera()
     }
 
+    /// Hit-tests the minimap scene for landmark nodes.
     func landmarkID(at point: CGPoint, in view: SCNView) -> UUID? {
         let hitResults = view.hitTest(point, options: nil)
 
@@ -366,12 +356,14 @@ final class MiniMapService {
         return nil
     }
 
+    /// Updates which landmark, if any, should be visually highlighted.
     func setSelectedLandmarkID(_ id: UUID?) {
         guard selectedLandmarkID != id else { return }
         selectedLandmarkID = id
         refreshLandmarkSelectionAppearance()
     }
 
+    /// Draws the current route as connected world-space segments.
     func updateNavigationRoute(_ points: [simd_float3], targetLandmarkID: UUID?) {
         routeRootNode.childNodes.forEach { $0.removeFromParentNode() }
 
@@ -388,11 +380,9 @@ final class MiniMapService {
         }
     }
 
-    // MARK: - Occupancy Grid Debug Overlay
+    // MARK: - Occupancy Grid Overlay
 
-    /// Renders the current A* occupancy grid as a flat texture overlay on the minimap floor.
-    /// Green = confirmed walkable floor (exploredCells).
-    /// Red   = obstacle + safety-buffer cells (dilatedCells).
+    /// Renders the current occupancy grid as a flat texture overlay on the minimap floor.
     func updateOccupancyGrid(_ snapshot: NavigationService.OccupancySnapshot) {
         occupancyGridRootNode.childNodes.forEach { $0.removeFromParentNode() }
 
@@ -407,24 +397,20 @@ final class MiniMapService {
         let cols = maxX - minX + 1
         let rows = maxZ - minZ + 1
 
-        // Scale down so the texture stays within 512×512 px
         let maxTex = 512
         let scale  = max(1, max((cols + maxTex - 1) / maxTex,
                                 (rows + maxTex - 1) / maxTex))
         let texW = max(1, (cols + scale - 1) / scale)
         let texH = max(1, (rows + scale - 1) / scale)
 
-        // Capture value types before going to background queue
         let exploredCells = snapshot.exploredCells
         let obstacleCells = snapshot.obstacleCells
         let cs = snapshot.cellSize
 
-        // Build the texture on a background thread (CGContext is thread-safe),
-        // then add the SceneKit node on the main thread.
+        // Build the texture off the main thread, then install the SceneKit node on the main thread.
         geometryQueue.async { [weak self] in
             guard let self else { return }
 
-            // Build image with CGContext directly (thread-safe, no UIKit needed)
             let colorSpace = CGColorSpaceCreateDeviceRGB()
             let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
             guard let cgCtx = CGContext(
@@ -433,20 +419,14 @@ final class MiniMapService {
                 space: colorSpace, bitmapInfo: bitmapInfo.rawValue
             ) else { return }
 
-            // 1. Fill entire canvas with "unexplored = blocked" light red.
-            //    Any cell not explicitly drawn green or dark-red will show this colour,
-            //    meaning areas the user hasn't scanned are treated as impassable.
             cgCtx.setFillColor(UIColor(red: 0.75, green: 0.20, blue: 0.20, alpha: 0.28).cgColor)
             cgCtx.fill(CGRect(x: 0, y: 0, width: texW, height: texH))
 
             func textureRow(for z: Int) -> Int {
                 let row = (z - minZ) / scale
-                // After rotating the plane onto the ground, image-space +Y points toward
-                // world-space -Z. Flip rows so the occupancy overlay matches AR world Z.
                 return texH - 1 - row
             }
 
-            // 2. Walkable floor — bright green (cells A* can actually route through)
             cgCtx.setFillColor(UIColor(red: 0.18, green: 0.85, blue: 0.38, alpha: 0.60).cgColor)
             for c in exploredCells {
                 cgCtx.fill(CGRect(x: (c.x - minX) / scale,
@@ -454,7 +434,6 @@ final class MiniMapService {
                                   width: 1, height: 1))
             }
 
-            // 3. Confirmed wall cells — brighter/darker red (overwrites green if overlap)
             cgCtx.setFillColor(UIColor(red: 0.92, green: 0.18, blue: 0.18, alpha: 0.70).cgColor)
             for c in obstacleCells {
                 cgCtx.fill(CGRect(x: (c.x - minX) / scale,
@@ -471,7 +450,7 @@ final class MiniMapService {
 
             let plane = SCNPlane(width: CGFloat(worldW), height: CGFloat(worldD))
             let mat = SCNMaterial()
-            mat.diffuse.contents = cgImage   // CGImage is thread-safe
+            mat.diffuse.contents = cgImage
             mat.isDoubleSided = true
             mat.lightingModel = .constant
             mat.blendMode = .alpha
@@ -487,11 +466,12 @@ final class MiniMapService {
         }
     }
 
-    /// Removes the occupancy grid overlay from the minimap.
+    /// Removes the occupancy-grid overlay from the minimap.
     func clearOccupancyGrid() {
         occupancyGridRootNode.childNodes.forEach { $0.removeFromParentNode() }
     }
 
+    /// Updates SceneKit mesh nodes used to visualize nearby structural geometry.
     func updateMeshAnchors(_ anchors: [ARMeshAnchor]) {
         let currentIds = Set(anchors.map(\.identifier))
         let now = CACurrentMediaTime()
@@ -531,12 +511,8 @@ final class MiniMapService {
                 meshNodes[anchor.identifier] = node
                 lastMeshRefreshTime[anchor.identifier] = now
             } else if node.geometry != nil {
-                // Geometry refresh returned nil (sampled faces were all horizontal this cycle).
-                // Keep the existing geometry visible — do NOT remove the node.
-                // Omitting lastMeshRefreshTime update so this anchor retries on the next publish.
                 meshNodes[anchor.identifier] = node
             } else {
-                // No existing geometry and couldn't build one — discard.
                 node.removeFromParentNode()
                 meshNodes.removeValue(forKey: anchor.identifier)
                 lastMeshRefreshTime.removeValue(forKey: anchor.identifier)
@@ -550,9 +526,9 @@ final class MiniMapService {
         }
     }
 
-    // MARK: - Camera logic
+    // MARK: - Camera Logic
 
-    /// Fixed 2.5D view, looking at minimap center.
+    /// Repositions the minimap camera for the current presentation mode.
     private func updateMiniMapCamera() {
         switch presentationMode {
         case .compact:
@@ -569,7 +545,7 @@ final class MiniMapService {
         }
     }
 
-    /// Only horizontal yaw matters. Ignore pitch/roll completely.
+    /// Extracts horizontal yaw from the AR camera transform.
     private func yawFromTransform(_ transform: simd_float4x4) -> Float {
         let forward = simd_float3(
             -transform.columns.2.x,
@@ -597,7 +573,7 @@ final class MiniMapService {
         return value
     }
 
-    // MARK: - Object rendering
+    // MARK: - Object Rendering
 
     private func makeObjectNode(for object: TrackedObject) -> SCNNode {
         let node = SCNNode()
@@ -642,14 +618,12 @@ final class MiniMapService {
         return node
     }
 
-    /// Landmark pin: hexagonal base + faded icon billboard.
-    /// Visually distinct from live tracked objects (circular base, full opacity).
+    /// Landmark pin rendering distinct from live tracked-object markers.
     private func makeLandmarkNode(for landmark: Landmark) -> SCNNode {
         let node = SCNNode()
         node.name = landmarkNodeName(for: landmark.id)
         let accent = accentColor(for: landmark.className)
 
-        // Hexagonal ring base (6 segments) — distinguishes landmark from live circle
         let ring = SCNTube(innerRadius: 0.09, outerRadius: 0.14, height: 0.012)
         ring.radialSegmentCount = 6
         ring.materials = Array(repeating: makeFlatMaterial(color: accent.withAlphaComponent(0.55)), count: 3)
@@ -657,20 +631,18 @@ final class MiniMapService {
         ringNode.position = SCNVector3(0, 0.006, 0)
         node.addChildNode(ringNode)
 
-        // Thin stem
         let stem = SCNCylinder(radius: 0.010, height: 0.17)
         stem.materials = Array(repeating: makeFlatMaterial(color: accent.withAlphaComponent(0.45)), count: 3)
         let stemNode = SCNNode(geometry: stem)
         stemNode.position = SCNVector3(0, 0.11, 0)
         node.addChildNode(stemNode)
 
-        // Faded icon billboard — same icon as live objects, lower opacity
         let iconPlane = SCNPlane(width: 0.46, height: 0.46)
         iconPlane.cornerRadius = 0.08
         let iconMat = makeSpriteMaterial(
             image: iconImage(for: landmark.className, tintColor: accent)
         )
-        iconMat.transparency = 0.38   // 62% visible — clearly "ghost" compared to live
+        iconMat.transparency = 0.38
         iconPlane.firstMaterial = iconMat
 
         let iconNode = SCNNode(geometry: iconPlane)
@@ -682,10 +654,12 @@ final class MiniMapService {
         return node
     }
 
+    /// Encodes landmark IDs into SceneKit node names for hit testing.
     private func landmarkNodeName(for id: UUID) -> String {
         "landmark:\(id.uuidString)"
     }
 
+    /// Decodes a landmark ID from a SceneKit node name.
     private func landmarkID(from nodeName: String?) -> UUID? {
         guard let nodeName,
               nodeName.hasPrefix("landmark:") else {
@@ -695,18 +669,21 @@ final class MiniMapService {
         return UUID(uuidString: String(nodeName.dropFirst("landmark:".count)))
     }
 
+    /// Reapplies selection highlighting to all current landmark nodes.
     private func refreshLandmarkSelectionAppearance() {
         for (id, node) in landmarkNodes {
             applySelectionStyle(to: node, isSelected: id == selectedLandmarkID)
         }
     }
 
+    /// Visually emphasizes the selected landmark without changing geometry.
     private func applySelectionStyle(to node: SCNNode, isSelected: Bool) {
         let scale: Float = isSelected ? 1.42 : 1.0
         node.scale = SCNVector3(scale, scale, scale)
         node.opacity = isSelected ? 1.0 : 0.9
     }
 
+    /// Creates one rendered segment of the current route.
     private func makeRouteSegmentNode(from start: simd_float3, to end: simd_float3) -> SCNNode {
         let planarStart = SIMD2<Float>(start.x, start.z)
         let planarEnd = SIMD2<Float>(end.x, end.z)
@@ -732,6 +709,7 @@ final class MiniMapService {
         return node
     }
 
+    /// Creates the destination marker shown at the end of a route.
     private func makeRouteEndpointNode(at point: simd_float3) -> SCNNode {
         let geometry = SCNTube(innerRadius: 0.12, outerRadius: 0.19, height: 0.015)
         geometry.radialSegmentCount = 36
@@ -747,6 +725,7 @@ final class MiniMapService {
         return node
     }
 
+    /// Shared accent color palette for live objects and landmarks.
     private func accentColor(for className: String) -> UIColor {
         switch className {
         case "person":
@@ -764,6 +743,7 @@ final class MiniMapService {
         }
     }
 
+    /// Maps detection classes to SF Symbols used in minimap billboards.
     private func symbolName(for className: String) -> String {
         switch className {
         case "person":
@@ -795,6 +775,7 @@ final class MiniMapService {
         }
     }
 
+    /// Renders an icon card texture used by billboard nodes.
     private func iconImage(for className: String, tintColor: UIColor) -> UIImage {
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 160, height: 160))
         let symbolConfig = UIImage.SymbolConfiguration(pointSize: 72, weight: .semibold)
@@ -832,6 +813,7 @@ final class MiniMapService {
         }
     }
 
+    /// Shortens long class names to keep billboard text readable.
     private func abbreviatedLabel(for className: String) -> String {
         switch className {
         case "dining table":
@@ -845,6 +827,7 @@ final class MiniMapService {
         }
     }
 
+    /// Creates an unlit SceneKit material for flat-colored geometry.
     private func makeFlatMaterial(color: UIColor) -> SCNMaterial {
         let material = SCNMaterial()
         material.diffuse.contents = color
@@ -853,6 +836,7 @@ final class MiniMapService {
         return material
     }
 
+    /// Creates a billboard material from a rendered icon texture.
     private func makeSpriteMaterial(image: UIImage) -> SCNMaterial {
         let material = SCNMaterial()
         material.diffuse.contents = image
@@ -867,6 +851,7 @@ final class MiniMapService {
         return material
     }
 
+    /// Creates a phong material for the user marker.
     private func makeMaterial(diffuse: UIColor, emission: UIColor) -> SCNMaterial {
         let material = SCNMaterial()
         material.diffuse.contents = diffuse
@@ -877,8 +862,9 @@ final class MiniMapService {
         return material
     }
 
-    // MARK: - Mesh helpers
+    // MARK: - Mesh Helpers
 
+    /// Reads one triangle's vertex indices from an AR mesh face buffer.
     private func faceIndices(
         for faceIndex: Int,
         faces: ARGeometryElement,
@@ -910,6 +896,7 @@ final class MiniMapService {
         return (i0, i1, i2)
     }
 
+    /// Reads one local-space vertex from an AR mesh vertex buffer.
     private func vertexAt(
         index: UInt32,
         vertices: ARGeometrySource,
@@ -924,8 +911,7 @@ final class MiniMapService {
         return simd_float3(v.x, v.y, v.z)
     }
 
-    /// Remove near-horizontal faces.
-    /// This removes floor and ceiling, while keeping vertical / tree-like / wall-like structures.
+    /// Filters out near-horizontal faces so the minimap emphasizes structural surfaces.
     private func shouldDropHorizontalFace(
         v0Local: simd_float3,
         v1Local: simd_float3,
@@ -942,7 +928,6 @@ final class MiniMapService {
         let crossValue = simd_cross(e1, e2)
         let area = simd_length(crossValue)
 
-        // Ignore degenerate tiny faces
         if area < 1e-5 {
             return true
         }
@@ -950,13 +935,12 @@ final class MiniMapService {
         let normal = simd_normalize(crossValue)
         let upDot = abs(simd_dot(normal, simd_float3(0, 1, 0)))
 
-        // If the face is close to horizontal, drop it
         return upDot > horizontalFaceThreshold
     }
 
-    // MARK: - Structure rendering
+    // MARK: - Structure Rendering
 
-    /// Keep vertical / structural faces, drop floor & ceiling faces.
+    /// Builds simplified SceneKit geometry that keeps structural faces and skips floor/ceiling.
     private func makeStructureGeometry(from anchor: ARMeshAnchor) -> SCNGeometry? {
         let geometry = anchor.geometry
 
@@ -1044,7 +1028,6 @@ final class MiniMapService {
             elements: [fillElement, lineElement]
         )
 
-        // Material 1: translucent blue body
         let fillMaterial = SCNMaterial()
         fillMaterial.diffuse.contents = UIColor(
             red: 0.20,
@@ -1064,7 +1047,6 @@ final class MiniMapService {
         fillMaterial.writesToDepthBuffer = false
         fillMaterial.blendMode = .alpha
 
-        // Material 2: wireframe structure overlay
         let lineMaterial = SCNMaterial()
         lineMaterial.diffuse.contents = UIColor(
             red: 0.10,

@@ -11,21 +11,21 @@ import Foundation
 import ARKit
 import simd
 
+/// Builds a sparse occupancy grid from AR meshes and computes walkable minimap routes.
 final class NavigationService {
 
-    // MARK: - Config
+    // MARK: - Grid Configuration
 
     /// World-space metres per grid cell.
     private let cellSize: Float = 0.25
     /// Extra cells of clearance added around each obstacle cell.
-    /// Set to 0 — wall cells are exact, no buffer expansion.
     private let dilationCells: Int = 0
     /// Safety cap to keep pathfinding interactive.
     private let maxAStarIterations = 8_000
     /// Sample only 1-in-N faces per anchor to keep rebuild fast.
     private let faceStepDivisor = 800
 
-    // MARK: - State
+    // MARK: - Occupancy State
 
     /// Cells confirmed as obstacle-free floor (upward-facing AR mesh faces).
     /// A* only routes through these — unexplored areas are impassable.
@@ -36,16 +36,14 @@ final class NavigationService {
     /// compete with the SceneKit render loop on the main thread.
     private let routeQueue = DispatchQueue(label: "inception.navigation.route", qos: .utility)
 
-    // MARK: - Types
+    // MARK: - Internal Types
 
     fileprivate struct GridCell: Hashable {
         let x: Int
         let z: Int
     }
 
-    /// Thread-safe snapshot of one ARMeshAnchor's geometry.
-    /// MTLBuffer contents are copied into `Data` on the calling (main) thread
-    /// so the background queue never touches live ARKit-owned memory.
+    /// Immutable snapshot of one mesh anchor captured before background processing begins.
     private struct AnchorSnapshot {
         let transform: simd_float4x4
         let vertexData: Data
@@ -83,8 +81,7 @@ final class NavigationService {
         )
     }
 
-    /// Copies MTLBuffer bytes from ARMeshAnchors into thread-safe `Data` objects.
-    /// **Must be called on the main thread** before dispatching to the background queue.
+    /// Copies live ARKit mesh buffers into immutable `Data` blobs for safe background use.
     private func snapshotAnchors(_ anchors: [ARMeshAnchor]) -> [AnchorSnapshot] {
         anchors.compactMap { anchor in
             let geo  = anchor.geometry
@@ -92,7 +89,6 @@ final class NavigationService {
             let faces = geo.faces
             let ipf   = faces.indexCountPerPrimitive
             guard ipf == 3, faces.count > 0 else { return nil }
-            // Data(bytes:count:) performs a memcpy — safe even if ARKit later mutates the buffer.
             let vData = Data(bytes: verts.buffer.contents(), count: verts.buffer.length)
             let fData = Data(bytes: faces.buffer.contents(), count: faces.buffer.length)
             return AnchorSnapshot(
@@ -107,14 +103,7 @@ final class NavigationService {
         }
     }
 
-    /// Rebuild the occupancy map from pre-snapshotted anchor geometry.
-    ///
-    /// Face classification (world-space normals, gravity-aligned Y axis):
-    ///   • |dot(n, up)| < 0.5  → vertical → wall / obstacle
-    ///   •  dot(n, up) > 0.7   → upward-facing → navigable floor
-    ///   • everything else (ceiling, slanted) → ignored
-    ///
-    /// Only cells confirmed as floor are passable; unexplored areas are blocked.
+    /// Rebuilds floor and obstacle cells from a batch of mesh-anchor snapshots.
     private func rebuildOccupancy(from snapshots: [AnchorSnapshot]) {
         var rawObstacles: Set<GridCell> = []
         var rawFloor:     Set<GridCell> = []
@@ -161,29 +150,21 @@ final class NavigationService {
                         let centroid    = (v0 + v1 + v2) / 3
 
                         if abs(normalDotUp) < 0.5 {
-                            // Vertical face → wall / obstacle
                             rawObstacles.insert(worldToCell(centroid))
                         } else if normalDotUp > 0.7 {
-                            // Upward-facing horizontal face → navigable floor
                             rawFloor.insert(worldToCell(centroid))
                         }
-                        // Downward (ceiling) and slanted faces are discarded
                     }
                 }
             }
         }
 
-        // ── Obstacle persistence with pass-through correction ─────────────────
-        // Historical obstacles accumulate (walls persist across scans).
-        // Exception: a cell the user has PREVIOUSLY walked through (already in
-        // exploredCells) and that the CURRENT scan does NOT see as a wall gets
-        // cleared — the user physically passing through is proof it isn't blocked.
-        // Cells the user hasn't visited yet keep their historical obstacle status.
+        // Preserve previously seen walls, but clear cells the user has already walked through.
         let passedAndNowClear = exploredCells.subtracting(rawObstacles)
-        dilatedCells.formUnion(rawObstacles)    // accumulate new walls
-        dilatedCells.subtract(passedAndNowClear) // correct false positives on walked paths
+        dilatedCells.formUnion(rawObstacles)
+        dilatedCells.subtract(passedAndNowClear)
 
-        // Dilate floor by 4 cells (~1 m) to bridge gaps in sparse AR floor scans.
+        // Expand floor coverage slightly to bridge gaps in sparse AR floor scans.
         var expandedFloor = rawFloor
         for c in rawFloor {
             for dx in -4...4 {
@@ -193,10 +174,6 @@ final class NavigationService {
             }
         }
 
-        // exploredCells only grows — cells are never removed.
-        // A* checks (exploredCells.contains && !dilatedCells.contains) at query time,
-        // so current obstacles naturally block routing without permanently erasing
-        // the floor memory.
         exploredCells.formUnion(expandedFloor)
     }
 
@@ -209,18 +186,11 @@ final class NavigationService {
 
     /// Find a smoothed path from `start` to `goal` through free space.
     /// Returns world-space XZ waypoints (Y held constant at `start.y`).
-    /// Returns an empty array when no navigable path exists — never returns a
-    /// straight line that cuts through walls.
-    ///
-    /// Two-pass strategy:
-    ///   1. Prefer a path through confirmed floor only (unexplored = impassable).
-    ///   2. If that fails (sparse scan) fall back to obstacle-only mode so the
-    ///      user still sees *some* route rather than nothing.
+    /// Uses a two-pass strategy: confirmed floor first, obstacle-only fallback second.
     func findPath(from start: simd_float3, to goal: simd_float3) -> [simd_float3] {
         let startCell = worldToCell(start)
         let goalCell  = worldToCell(goal)
 
-        // ── Pass 1: explored-floor constraint ──────────────────────────────
         if !exploredCells.isEmpty {
             let sc = nearestFreeCell(to: startCell)
             let gc = nearestFreeCell(to: goalCell)
@@ -232,10 +202,6 @@ final class NavigationService {
             }
         }
 
-        // ── Pass 2: obstacle-only fallback ─────────────────────────────────
-        // Floor data exists but no connected path through scanned floor yet
-        // (user hasn't scanned the full route).  Route through non-obstacle
-        // space so navigation is still usable.
         let sc2 = nearestFreeCellObstacleOnly(to: startCell)
         let gc2 = nearestFreeCellObstacleOnly(to: goalCell)
         guard sc2 != gc2 else { return [goal] }
@@ -245,7 +211,7 @@ final class NavigationService {
         return smoothPath(raw2.map { cellToWorld($0, y: start.y) })
     }
 
-    /// Nearest cell that is obstacle-free (ignores exploredCells constraint).
+    /// Finds the nearest obstacle-free cell, ignoring floor-confirmation requirements.
     private func nearestFreeCellObstacleOnly(to cell: GridCell, maxRadius: Int = 8) -> GridCell {
         guard dilatedCells.contains(cell) else { return cell }
         for r in 1...maxRadius {
@@ -260,10 +226,7 @@ final class NavigationService {
         return cell
     }
 
-    /// Returns the nearest passable grid cell to `cell`.
-    /// A cell is passable when it is not an obstacle AND lies in a scanned
-    /// floor area (or no floor data exists yet, in which case only the
-    /// obstacle check applies).
+    /// Finds the nearest cell that is both obstacle-free and passable for the current routing mode.
     private func nearestFreeCell(to cell: GridCell, maxRadius: Int = 8) -> GridCell {
         let isFree: (GridCell) -> Bool = { [self] c in
             !dilatedCells.contains(c) &&
@@ -279,7 +242,7 @@ final class NavigationService {
                 }
             }
         }
-        return cell   // fallback: original cell
+        return cell
     }
 
     func calculateRoute(
@@ -288,10 +251,6 @@ final class NavigationService {
         using anchors: [ARMeshAnchor],
         completion: @escaping ([simd_float3]) -> Void
     ) {
-        // Copy MTLBuffer contents into Data on the calling (main) thread BEFORE
-        // dispatching to the background queue.  Accessing an ARKit MTLBuffer's
-        // raw bytes from a non-AR thread causes EXC_BAD_ACCESS because ARKit
-        // may reallocate or update the buffer concurrently.
         let snapshots = snapshotAnchors(anchors)
         routeQueue.async { [weak self] in
             guard let self else { return }
@@ -303,7 +262,7 @@ final class NavigationService {
         }
     }
 
-    // MARK: - A*
+    // MARK: - A* Search
 
     private struct AStarNode: Comparable {
         let cell: GridCell
@@ -311,7 +270,7 @@ final class NavigationService {
         static func < (a: Self, b: Self) -> Bool { a.f < b.f }
     }
 
-    /// `exploredOnly`: when true, only routes through cells in `exploredCells`.
+    /// When `exploredOnly` is true, the search is constrained to confirmed floor cells.
     private func astar(from start: GridCell, to goal: GridCell, exploredOnly: Bool) -> [GridCell] {
         var open     = MinHeap<AStarNode>()
         var cameFrom = [GridCell: GridCell]()
@@ -333,7 +292,6 @@ final class NavigationService {
 
             for (nb, moveCost) in neighborCosts(of: cur.cell) {
                 guard !closed.contains(nb), !dilatedCells.contains(nb) else { continue }
-                // In explored-only mode, skip cells that haven't been scanned as floor.
                 if exploredOnly && !exploredCells.isEmpty && !exploredCells.contains(nb) { continue }
                 let tentG = (gScore[cur.cell] ?? .infinity) + moveCost
                 if tentG < (gScore[nb] ?? .infinity) {
@@ -343,7 +301,7 @@ final class NavigationService {
                 }
             }
         }
-        return []   // no path found
+        return []
     }
 
     private func reconstructPath(_ cameFrom: [GridCell: GridCell], end: GridCell) -> [GridCell] {
@@ -353,8 +311,9 @@ final class NavigationService {
         return path.reversed()
     }
 
-    // MARK: - Path Smoothing (greedy line-of-sight)
+    // MARK: - Path Smoothing
 
+    /// Removes unnecessary intermediate points when a later waypoint is directly reachable.
     private func smoothPath(_ path: [simd_float3]) -> [simd_float3] {
         guard path.count > 2 else { return path }
         var result = [path[0]]
@@ -370,7 +329,7 @@ final class NavigationService {
         return result
     }
 
-    /// Bresenham rasterisation of the line between two world positions.
+    /// Uses Bresenham rasterization to verify obstacle-free line of sight between waypoints.
     private func lineOfSight(from a: simd_float3, to b: simd_float3) -> Bool {
         var p   = worldToCell(a)
         let end = worldToCell(b)
@@ -402,22 +361,20 @@ final class NavigationService {
         )
     }
 
-    /// Octile distance heuristic for 8-directional A*.
+    /// Octile-distance heuristic for 8-directional grid search.
     private func octile(_ a: GridCell, _ b: GridCell) -> Float {
         let dx = Float(abs(a.x - b.x))
         let dz = Float(abs(a.z - b.z))
         return 1.414 * min(dx, dz) + abs(dx - dz)
     }
 
+    /// Returns the eight neighboring cells and their movement costs.
     private func neighborCosts(of c: GridCell) -> [(GridCell, Float)] {
         var result = [(GridCell, Float)]()
         result.reserveCapacity(8)
         for dx in -1...1 {
             for dz in -1...1 {
                 guard dx != 0 || dz != 0 else { continue }
-                // Prevent diagonal moves from cutting through wall corners.
-                // A diagonal step (dx,dz) is only legal when both intermediate
-                // cardinal cells are also free.
                 if dx != 0 && dz != 0 {
                     if dilatedCells.contains(GridCell(x: c.x + dx, z: c.z)) ||
                        dilatedCells.contains(GridCell(x: c.x, z: c.z + dz)) {
@@ -432,8 +389,9 @@ final class NavigationService {
     }
 }
 
-// MARK: - Min-Heap (binary heap for A* open set)
+// MARK: - Min-Heap
 
+/// Minimal binary heap used as the A* open set.
 private struct MinHeap<T: Comparable> {
     private var data: [T] = []
     var isEmpty: Bool { data.isEmpty }

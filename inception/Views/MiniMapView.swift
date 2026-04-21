@@ -8,6 +8,7 @@
 import SwiftUI
 import SceneKit
 
+/// SwiftUI wrapper around the SceneKit-based minimap renderer.
 struct MiniMapView: UIViewRepresentable {
     let scene: SCNScene
     let isZoomEnabled: Bool
@@ -88,7 +89,9 @@ struct MiniMapView: UIViewRepresentable {
         uiView.isPlaying = true
     }
 }
+
 extension MiniMapView {
+    /// Coordinates SceneKit gestures and forwards them to the SwiftUI view model layer.
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         private let onZoomChanged: (Double) -> Void
         private let onPanChanged: (CGPoint, CGSize) -> Void

@@ -7,6 +7,7 @@
 import SwiftUI
 import CoreGraphics
 
+/// Raw object detection decoded from the model output tensor.
 struct Detection {
     let bbox: CGRect
     let classId: Int
@@ -15,6 +16,7 @@ struct Detection {
     let maskCoeffs: [Float]
 }
 
+/// COCO class list expected by the bundled YOLO model.
 let COCO_CLASSES = [
     "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
     "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
@@ -29,6 +31,7 @@ let COCO_CLASSES = [
 ]
 
 extension Detection {
+    /// Shared UI accent color for overlays and minimap markers.
     var color: UIColor {
         switch className {
         case "car", "truck", "bus", "motorcycle", "bicycle": return .red
@@ -37,6 +40,7 @@ extension Detection {
         }
     }
 
+    /// Human-readable label shown in the camera overlay.
     var label: String {
         "\(className) \(Int(confidence * 100))%"
     }

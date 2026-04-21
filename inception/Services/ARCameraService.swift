@@ -137,8 +137,10 @@ final class ARCameraService: NSObject {
     // MARK: - Private state
 
     private var currentMeshAnchors: [UUID: ARMeshAnchor] = [:]
+    private var pendingMeshAnchorRemovals: [UUID: TimeInterval] = [:]
     private var lastMeshPublishTime: TimeInterval = 0
-    private let meshPublishInterval: TimeInterval = 1.5
+    private let meshPublishInterval: TimeInterval = 0.45
+    private let meshAnchorRemovalGracePeriod: TimeInterval = 2.0
 
     override init() {
         super.init()
@@ -176,6 +178,7 @@ final class ARCameraService: NSObject {
     func stop() {
         session.pause()
         currentMeshAnchors.removeAll()
+        pendingMeshAnchorRemovals.removeAll()
         endProcessing()
     }
 
@@ -229,9 +232,24 @@ final class ARCameraService: NSObject {
     // MARK: - Mesh publishing
 
     private func publishMeshAnchorsIfNeeded(timestamp: TimeInterval) {
+        expireRemovedMeshAnchors(at: timestamp)
         guard timestamp - lastMeshPublishTime >= meshPublishInterval else { return }
         lastMeshPublishTime = timestamp
         meshAnchorPublisher.send(Array(currentMeshAnchors.values))
+    }
+
+    private func expireRemovedMeshAnchors(at timestamp: TimeInterval) {
+        guard !pendingMeshAnchorRemovals.isEmpty else { return }
+
+        let expiredIDs = pendingMeshAnchorRemovals.compactMap { id, removalTime in
+            timestamp - removalTime >= meshAnchorRemovalGracePeriod ? id : nil
+        }
+
+        guard !expiredIDs.isEmpty else { return }
+        for id in expiredIDs {
+            pendingMeshAnchorRemovals.removeValue(forKey: id)
+            currentMeshAnchors.removeValue(forKey: id)
+        }
     }
 
     /// Extracts scene depth metadata without copying the depth map pixel data.
@@ -318,6 +336,7 @@ extension ARCameraService: ARSessionDelegate {
         for anchor in anchors {
             if let mesh = anchor as? ARMeshAnchor {
                 currentMeshAnchors[mesh.identifier] = mesh
+                pendingMeshAnchorRemovals.removeValue(forKey: mesh.identifier)
             }
         }
     }
@@ -326,13 +345,15 @@ extension ARCameraService: ARSessionDelegate {
         for anchor in anchors {
             if let mesh = anchor as? ARMeshAnchor {
                 currentMeshAnchors[mesh.identifier] = mesh
+                pendingMeshAnchorRemovals.removeValue(forKey: mesh.identifier)
             }
         }
     }
 
     func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        let removalTime = CACurrentMediaTime()
         for anchor in anchors {
-            currentMeshAnchors.removeValue(forKey: anchor.identifier)
+            pendingMeshAnchorRemovals[anchor.identifier] = removalTime
         }
     }
 }

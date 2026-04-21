@@ -36,6 +36,7 @@ final class MiniMapService {
 
     private let environmentRootNode = SCNNode()
     private let routeRootNode = SCNNode()
+    private let occupancyGridRootNode = SCNNode()
     private let objectsRootNode = SCNNode()
 
     /// User marker and heading live outside world transform tree,
@@ -81,9 +82,9 @@ final class MiniMapService {
 
     /// If a face normal is too close to world up/down, we treat it as a horizontal surface.
     /// Raising this value keeps more slanted surfaces; lowering removes more near-horizontal faces.
-    private let horizontalFaceThreshold: Float = 0.88
-    private let meshRefreshInterval: TimeInterval = 2.5
-    private let maxFacesPerAnchor = 1_000
+    private let horizontalFaceThreshold: Float = 0.94
+    private let meshRefreshInterval: TimeInterval = 0.8
+    private let maxFacesPerAnchor = 2_500
     private let positionSmoothingAlpha: Float = 0.18
     private let yawSmoothingAlpha: Float = 0.14
     private let compactOrthographicScale: Double = 3.2
@@ -99,6 +100,7 @@ final class MiniMapService {
         rotationRootNode.addChildNode(translationRootNode)
 
         translationRootNode.addChildNode(environmentRootNode)
+        translationRootNode.addChildNode(occupancyGridRootNode)
         translationRootNode.addChildNode(routeRootNode)
         translationRootNode.addChildNode(landmarksRootNode)
         translationRootNode.addChildNode(objectsRootNode)
@@ -384,6 +386,110 @@ final class MiniMapService {
             let endpointNode = makeRouteEndpointNode(at: lastPoint)
             routeRootNode.addChildNode(endpointNode)
         }
+    }
+
+    // MARK: - Occupancy Grid Debug Overlay
+
+    /// Renders the current A* occupancy grid as a flat texture overlay on the minimap floor.
+    /// Green = confirmed walkable floor (exploredCells).
+    /// Red   = obstacle + safety-buffer cells (dilatedCells).
+    func updateOccupancyGrid(_ snapshot: NavigationService.OccupancySnapshot) {
+        occupancyGridRootNode.childNodes.forEach { $0.removeFromParentNode() }
+
+        let allCells = snapshot.exploredCells + snapshot.obstacleCells
+        guard !allCells.isEmpty else { return }
+
+        let xs = allCells.map { $0.x }
+        let zs = allCells.map { $0.z }
+        guard let minX = xs.min(), let maxX = xs.max(),
+              let minZ = zs.min(), let maxZ = zs.max() else { return }
+
+        let cols = maxX - minX + 1
+        let rows = maxZ - minZ + 1
+
+        // Scale down so the texture stays within 512×512 px
+        let maxTex = 512
+        let scale  = max(1, max((cols + maxTex - 1) / maxTex,
+                                (rows + maxTex - 1) / maxTex))
+        let texW = max(1, (cols + scale - 1) / scale)
+        let texH = max(1, (rows + scale - 1) / scale)
+
+        // Capture value types before going to background queue
+        let exploredCells = snapshot.exploredCells
+        let obstacleCells = snapshot.obstacleCells
+        let cs = snapshot.cellSize
+
+        // Build the texture on a background thread (CGContext is thread-safe),
+        // then add the SceneKit node on the main thread.
+        geometryQueue.async { [weak self] in
+            guard let self else { return }
+
+            // Build image with CGContext directly (thread-safe, no UIKit needed)
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+            guard let cgCtx = CGContext(
+                data: nil, width: texW, height: texH,
+                bitsPerComponent: 8, bytesPerRow: texW * 4,
+                space: colorSpace, bitmapInfo: bitmapInfo.rawValue
+            ) else { return }
+
+            // 1. Fill entire canvas with "unexplored = blocked" light red.
+            //    Any cell not explicitly drawn green or dark-red will show this colour,
+            //    meaning areas the user hasn't scanned are treated as impassable.
+            cgCtx.setFillColor(UIColor(red: 0.75, green: 0.20, blue: 0.20, alpha: 0.28).cgColor)
+            cgCtx.fill(CGRect(x: 0, y: 0, width: texW, height: texH))
+
+            func textureRow(for z: Int) -> Int {
+                let row = (z - minZ) / scale
+                // After rotating the plane onto the ground, image-space +Y points toward
+                // world-space -Z. Flip rows so the occupancy overlay matches AR world Z.
+                return texH - 1 - row
+            }
+
+            // 2. Walkable floor — bright green (cells A* can actually route through)
+            cgCtx.setFillColor(UIColor(red: 0.18, green: 0.85, blue: 0.38, alpha: 0.60).cgColor)
+            for c in exploredCells {
+                cgCtx.fill(CGRect(x: (c.x - minX) / scale,
+                                  y: textureRow(for: c.z),
+                                  width: 1, height: 1))
+            }
+
+            // 3. Confirmed wall cells — brighter/darker red (overwrites green if overlap)
+            cgCtx.setFillColor(UIColor(red: 0.92, green: 0.18, blue: 0.18, alpha: 0.70).cgColor)
+            for c in obstacleCells {
+                cgCtx.fill(CGRect(x: (c.x - minX) / scale,
+                                  y: textureRow(for: c.z),
+                                  width: 1, height: 1))
+            }
+
+            guard let cgImage = cgCtx.makeImage() else { return }
+
+            let worldW  = Float(cols) * cs
+            let worldD  = Float(rows) * cs
+            let worldCX = Float(minX) * cs + worldW * 0.5
+            let worldCZ = Float(minZ) * cs + worldD * 0.5
+
+            let plane = SCNPlane(width: CGFloat(worldW), height: CGFloat(worldD))
+            let mat = SCNMaterial()
+            mat.diffuse.contents = cgImage   // CGImage is thread-safe
+            mat.isDoubleSided = true
+            mat.lightingModel = .constant
+            mat.blendMode = .alpha
+            plane.materials = [mat]
+
+            let node = SCNNode(geometry: plane)
+            node.eulerAngles = SCNVector3(-Float.pi / 2, 0, 0)
+            node.position    = SCNVector3(worldCX, 0.015, worldCZ)
+
+            DispatchQueue.main.async { [weak self] in
+                self?.occupancyGridRootNode.addChildNode(node)
+            }
+        }
+    }
+
+    /// Removes the occupancy grid overlay from the minimap.
+    func clearOccupancyGrid() {
+        occupancyGridRootNode.childNodes.forEach { $0.removeFromParentNode() }
     }
 
     func updateMeshAnchors(_ anchors: [ARMeshAnchor]) {

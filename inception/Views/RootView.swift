@@ -17,7 +17,7 @@ struct RootView: View {
             let safeInsets = proxy.safeAreaInsets
 
             ZStack {
-                CameraPreviewView(pixelBuffer: viewModel.cameraPixelBuffer)
+                CameraPreviewView(source: viewModel.cameraPreviewSource)
                     .ignoresSafeArea()
 
                 DetectionOverlayView(

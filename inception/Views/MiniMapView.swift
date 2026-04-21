@@ -38,10 +38,10 @@ struct MiniMapView: UIViewRepresentable {
         view.backgroundColor = UIColor(white: 0.94, alpha: 0.96)
         view.autoenablesDefaultLighting = false
         view.allowsCameraControl = false
-        view.rendersContinuously = false
-        view.isPlaying = false
+        view.rendersContinuously = true
+        view.isPlaying = true
         view.antialiasingMode = .none
-        view.preferredFramesPerSecond = 30
+        view.preferredFramesPerSecond = 60
 
         let tapGesture = UITapGestureRecognizer(
             target: context.coordinator,
@@ -85,6 +85,7 @@ struct MiniMapView: UIViewRepresentable {
         }
         context.coordinator.setZoomEnabled(isZoomEnabled)
         uiView.isUserInteractionEnabled = true
+        uiView.isPlaying = true
     }
 }
 extension MiniMapView {

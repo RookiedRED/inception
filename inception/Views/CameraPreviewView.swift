@@ -4,23 +4,41 @@ import CoreVideo
 import MetalKit
 
 struct CameraPreviewView: UIViewRepresentable {
-    let pixelBuffer: CVPixelBuffer?
+    let source: CameraPreviewSource
 
     func makeUIView(context: Context) -> PreviewMetalView {
         let view = PreviewMetalView()
         view.backgroundColor = .black
+        source.attach(view)
         return view
     }
 
     func updateUIView(_ uiView: PreviewMetalView, context: Context) {
-        uiView.pixelBuffer = pixelBuffer
-        uiView.draw()
+        source.attach(uiView)
     }
 
 }
 
+@MainActor
+final class CameraPreviewSource {
+    private weak var view: PreviewMetalView?
+    private var latestPixelBuffer: CVPixelBuffer?
+
+    func attach(_ view: PreviewMetalView) {
+        self.view = view
+        if let latestPixelBuffer {
+            view.setPixelBuffer(latestPixelBuffer)
+        }
+    }
+
+    func publish(_ pixelBuffer: CVPixelBuffer) {
+        latestPixelBuffer = pixelBuffer
+        view?.setPixelBuffer(pixelBuffer)
+    }
+}
+
 final class PreviewMetalView: MTKView {
-    var pixelBuffer: CVPixelBuffer?
+    private var pixelBuffer: CVPixelBuffer?
 
     private let ciContext: CIContext?
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -32,10 +50,11 @@ final class PreviewMetalView: MTKView {
 
         framebufferOnly = false
         isOpaque = true
-        enableSetNeedsDisplay = true
-        isPaused = true
+        enableSetNeedsDisplay = false
+        isPaused = false
         autoResizeDrawable = true
         contentMode = .scaleToFill
+        preferredFramesPerSecond = 60
     }
 
     @available(*, unavailable)
@@ -80,5 +99,9 @@ final class PreviewMetalView: MTKView {
         )
 
         currentDrawable.present()
+    }
+
+    func setPixelBuffer(_ pixelBuffer: CVPixelBuffer) {
+        self.pixelBuffer = pixelBuffer
     }
 }

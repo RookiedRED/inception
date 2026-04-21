@@ -17,8 +17,9 @@ final class NavigationService {
 
     /// World-space metres per grid cell.
     private let cellSize: Float = 0.25
-    /// Cells of clearance around each obstacle (~0.5 m).
-    private let dilationCells: Int = 2
+    /// Extra cells of clearance added around each obstacle cell.
+    /// Set to 0 — wall cells are exact, no buffer expansion.
+    private let dilationCells: Int = 0
     /// Safety cap to keep pathfinding interactive.
     private let maxAStarIterations = 8_000
     /// Sample only 1-in-N faces per anchor to keep rebuild fast.
@@ -42,9 +43,71 @@ final class NavigationService {
         let z: Int
     }
 
+    /// Thread-safe snapshot of one ARMeshAnchor's geometry.
+    /// MTLBuffer contents are copied into `Data` on the calling (main) thread
+    /// so the background queue never touches live ARKit-owned memory.
+    private struct AnchorSnapshot {
+        let transform: simd_float4x4
+        let vertexData: Data
+        let vertexStride: Int
+        let faceData: Data
+        let faceCount: Int
+        let bytesPerIndex: Int
+        let indicesPerFace: Int
+    }
+
     // MARK: - Public API
 
-    /// Rebuild the occupancy map from AR scene mesh anchors.
+    /// A snapshot of the current occupancy grid for debug visualisation.
+    struct OccupancySnapshot {
+        /// Cells A* can actually route through: explored floor AND not currently
+        /// blocked by an obstacle.  Shown as green in the minimap overlay.
+        let exploredCells: [(x: Int, z: Int)]
+        /// Currently detected obstacle cells (walls).  Shown as red.
+        let obstacleCells: [(x: Int, z: Int)]
+        /// World metres per cell.
+        let cellSize: Float
+    }
+
+    /// Captures the current A* grid state for debug visualisation.
+    /// Must be called after a `calculateRoute` completion fires.
+    func occupancySnapshot() -> OccupancySnapshot {
+        // Only return cells that A* can genuinely route through (explored AND obstacle-free).
+        let passable = exploredCells
+            .filter { !dilatedCells.contains($0) }
+            .map    { (x: $0.x, z: $0.z) }
+        return OccupancySnapshot(
+            exploredCells: passable,
+            obstacleCells: dilatedCells.map { (x: $0.x, z: $0.z) },
+            cellSize: cellSize
+        )
+    }
+
+    /// Copies MTLBuffer bytes from ARMeshAnchors into thread-safe `Data` objects.
+    /// **Must be called on the main thread** before dispatching to the background queue.
+    private func snapshotAnchors(_ anchors: [ARMeshAnchor]) -> [AnchorSnapshot] {
+        anchors.compactMap { anchor in
+            let geo  = anchor.geometry
+            let verts = geo.vertices
+            let faces = geo.faces
+            let ipf   = faces.indexCountPerPrimitive
+            guard ipf == 3, faces.count > 0 else { return nil }
+            // Data(bytes:count:) performs a memcpy — safe even if ARKit later mutates the buffer.
+            let vData = Data(bytes: verts.buffer.contents(), count: verts.buffer.length)
+            let fData = Data(bytes: faces.buffer.contents(), count: faces.buffer.length)
+            return AnchorSnapshot(
+                transform:      anchor.transform,
+                vertexData:     vData,
+                vertexStride:   verts.stride,
+                faceData:       fData,
+                faceCount:      faces.count,
+                bytesPerIndex:  faces.bytesPerIndex,
+                indicesPerFace: ipf
+            )
+        }
+    }
+
+    /// Rebuild the occupancy map from pre-snapshotted anchor geometry.
     ///
     /// Face classification (world-space normals, gravity-aligned Y axis):
     ///   • |dot(n, up)| < 0.5  → vertical → wall / obstacle
@@ -52,78 +115,75 @@ final class NavigationService {
     ///   • everything else (ceiling, slanted) → ignored
     ///
     /// Only cells confirmed as floor are passable; unexplored areas are blocked.
-    func rebuildOccupancy(from anchors: [ARMeshAnchor]) {
+    private func rebuildOccupancy(from snapshots: [AnchorSnapshot]) {
         var rawObstacles: Set<GridCell> = []
         var rawFloor:     Set<GridCell> = []
 
-        for anchor in anchors {
-            let geo   = anchor.geometry
-            let verts = geo.vertices
-            let faces = geo.faces
-            let faceCount = faces.count
-            let bpi = faces.bytesPerIndex
-            let ipf = faces.indexCountPerPrimitive
-            guard ipf == 3, faceCount > 0 else { continue }
+        for snap in snapshots {
+            let faceCount = snap.faceCount
+            let bpi       = snap.bytesPerIndex
+            let ipf       = snap.indicesPerFace
+            let faceStep  = max(1, faceCount / faceStepDivisor)
 
-            let vBuf = verts.buffer.contents()
-            let fBuf = faces.buffer.contents()
-            let faceStep = max(1, faceCount / faceStepDivisor)
+            snap.vertexData.withUnsafeBytes { vRaw in
+                snap.faceData.withUnsafeBytes { fRaw in
+                    let vBuf = vRaw.baseAddress!
+                    let fBuf = fRaw.baseAddress!
 
-            for fi in stride(from: 0, to: faceCount, by: faceStep) {
-                let base = fBuf.advanced(by: fi * ipf * bpi)
+                    for fi in stride(from: 0, to: faceCount, by: faceStep) {
+                        let base = fBuf.advanced(by: fi * ipf * bpi)
 
-                func readIdx(_ offset: Int) -> UInt32 {
-                    let ptr = base.advanced(by: offset * bpi)
-                    return bpi == 2
-                        ? UInt32(ptr.assumingMemoryBound(to: UInt16.self).pointee)
-                        : ptr.assumingMemoryBound(to: UInt32.self).pointee
-                }
+                        func readIdx(_ offset: Int) -> UInt32 {
+                            let ptr = base.advanced(by: offset * bpi)
+                            return bpi == 2
+                                ? UInt32(ptr.assumingMemoryBound(to: UInt16.self).pointee)
+                                : ptr.assumingMemoryBound(to: UInt32.self).pointee
+                        }
 
-                func worldVertex(_ i: UInt32) -> simd_float3 {
-                    let lp = vBuf
-                        .advanced(by: Int(i) * verts.stride)
-                        .assumingMemoryBound(to: SIMD3<Float>.self).pointee
-                    let w = anchor.transform * simd_float4(lp.x, lp.y, lp.z, 1)
-                    return simd_float3(w.x, w.y, w.z)
-                }
+                        func worldVertex(_ i: UInt32) -> simd_float3 {
+                            let lp = vBuf
+                                .advanced(by: Int(i) * snap.vertexStride)
+                                .assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                            let w = snap.transform * simd_float4(lp.x, lp.y, lp.z, 1)
+                            return simd_float3(w.x, w.y, w.z)
+                        }
 
-                let v0 = worldVertex(readIdx(0))
-                let v1 = worldVertex(readIdx(1))
-                let v2 = worldVertex(readIdx(2))
+                        let v0 = worldVertex(readIdx(0))
+                        let v1 = worldVertex(readIdx(1))
+                        let v2 = worldVertex(readIdx(2))
 
-                let cross = simd_cross(v1 - v0, v2 - v0)
-                let area  = simd_length(cross)
-                guard area > 1e-6 else { continue }
-                let normal = cross / area
+                        let cross = simd_cross(v1 - v0, v2 - v0)
+                        let area  = simd_length(cross)
+                        guard area > 1e-6 else { continue }
+                        let normal = cross / area
 
-                let normalDotUp = simd_dot(normal, SIMD3<Float>(0, 1, 0))
-                let centroid    = (v0 + v1 + v2) / 3
+                        let normalDotUp = simd_dot(normal, SIMD3<Float>(0, 1, 0))
+                        let centroid    = (v0 + v1 + v2) / 3
 
-                if abs(normalDotUp) < 0.5 {
-                    // Vertical face → wall / obstacle
-                    rawObstacles.insert(worldToCell(centroid))
-                } else if normalDotUp > 0.7 {
-                    // Upward-facing horizontal face → navigable floor
-                    rawFloor.insert(worldToCell(centroid))
-                }
-                // Downward (ceiling) and slanted faces are discarded
-            }
-        }
-
-        // Dilate obstacles to add safety clearance around walls
-        var dilated = rawObstacles
-        for c in rawObstacles {
-            for dx in -dilationCells...dilationCells {
-                for dz in -dilationCells...dilationCells {
-                    dilated.insert(GridCell(x: c.x + dx, z: c.z + dz))
+                        if abs(normalDotUp) < 0.5 {
+                            // Vertical face → wall / obstacle
+                            rawObstacles.insert(worldToCell(centroid))
+                        } else if normalDotUp > 0.7 {
+                            // Upward-facing horizontal face → navigable floor
+                            rawFloor.insert(worldToCell(centroid))
+                        }
+                        // Downward (ceiling) and slanted faces are discarded
+                    }
                 }
             }
         }
-        dilatedCells = dilated
 
-        // Dilate floor by 4 cells (~1 m) to bridge the gaps between sparse AR
-        // floor scans.  A user walking through a 2 m corridor generates enough
-        // floor faces that the full corridor width becomes reachable after dilation.
+        // ── Obstacle persistence with pass-through correction ─────────────────
+        // Historical obstacles accumulate (walls persist across scans).
+        // Exception: a cell the user has PREVIOUSLY walked through (already in
+        // exploredCells) and that the CURRENT scan does NOT see as a wall gets
+        // cleared — the user physically passing through is proof it isn't blocked.
+        // Cells the user hasn't visited yet keep their historical obstacle status.
+        let passedAndNowClear = exploredCells.subtracting(rawObstacles)
+        dilatedCells.formUnion(rawObstacles)    // accumulate new walls
+        dilatedCells.subtract(passedAndNowClear) // correct false positives on walked paths
+
+        // Dilate floor by 4 cells (~1 m) to bridge gaps in sparse AR floor scans.
         var expandedFloor = rawFloor
         for c in rawFloor {
             for dx in -4...4 {
@@ -132,7 +192,19 @@ final class NavigationService {
                 }
             }
         }
-        exploredCells = expandedFloor.subtracting(dilatedCells)
+
+        // exploredCells only grows — cells are never removed.
+        // A* checks (exploredCells.contains && !dilatedCells.contains) at query time,
+        // so current obstacles naturally block routing without permanently erasing
+        // the floor memory.
+        exploredCells.formUnion(expandedFloor)
+    }
+
+    /// Clears accumulated occupancy data.
+    /// Call this when the AR session restarts or the user requests a fresh scan.
+    func resetOccupancy() {
+        exploredCells = []
+        dilatedCells  = []
     }
 
     /// Find a smoothed path from `start` to `goal` through free space.
@@ -216,9 +288,14 @@ final class NavigationService {
         using anchors: [ARMeshAnchor],
         completion: @escaping ([simd_float3]) -> Void
     ) {
+        // Copy MTLBuffer contents into Data on the calling (main) thread BEFORE
+        // dispatching to the background queue.  Accessing an ARKit MTLBuffer's
+        // raw bytes from a non-AR thread causes EXC_BAD_ACCESS because ARKit
+        // may reallocate or update the buffer concurrently.
+        let snapshots = snapshotAnchors(anchors)
         routeQueue.async { [weak self] in
             guard let self else { return }
-            self.rebuildOccupancy(from: anchors)
+            self.rebuildOccupancy(from: snapshots)
             let route = self.findPath(from: start, to: goal)
             DispatchQueue.main.async {
                 completion(route)

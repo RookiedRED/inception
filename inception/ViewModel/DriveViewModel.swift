@@ -28,7 +28,6 @@ final class DriveViewModel: ObservableObject {
 
     // MARK: - Published UI State
 
-    @Published var cameraPixelBuffer: CVPixelBuffer?
     @Published var trackedObjects: [TrackedObject] = []
     @Published var inferenceMs: Double = 0
     @Published var detectionCount: Int = 0
@@ -48,14 +47,17 @@ final class DriveViewModel: ObservableObject {
     /// Current route waypoints displayed on the minimap.
     @Published var navigationRoute: [simd_float3] = []
 
+    let cameraPreviewSource = CameraPreviewSource()
+
     private var navigationTargetID: UUID?
     /// Index into `navigationRoute` of the next waypoint to reach.
     private var navigationWaypointIndex = 0
     private var navigationRequestID = UUID()
     private var lastRouteRefreshTime: CFTimeInterval = 0
     private var lastRouteRefreshPosition: simd_float3?
-    private let routeRefreshInterval: CFTimeInterval = 1.4
-    private let routeRefreshDistanceThreshold: Float = 0.75
+    // Refresh navigation more aggressively so the route responds sooner to user motion.
+    private let routeRefreshInterval: CFTimeInterval = 0.6
+    private let routeRefreshDistanceThreshold: Float = 0.3
 
     // MARK: - Internal State
 
@@ -66,9 +68,11 @@ final class DriveViewModel: ObservableObject {
     private var latestCameraTimestamp: TimeInterval = 0
     private var latestTrackedObjectsTimestamp: TimeInterval = 0
     private var lastInferenceTime: CFTimeInterval = 0
+    private var lastMiniMapCameraUpdateTime: CFTimeInterval = 0
     /// EWMA of recent inference latency (ms). Seed at 100ms as a safe starting estimate.
     private var ewmaInferenceMs: Double = 100.0
     private let ewmaAlpha: Double = 0.15  // smoothing factor; lower = more stable
+    private let miniMapCameraUpdateInterval: CFTimeInterval = 1.0 / 30.0
 
     /// Adaptive minimum interval targeting 65% Neural Engine duty cycle.
     /// If inference is fast (70ms) → ~108ms interval (≈9fps).
@@ -138,9 +142,11 @@ final class DriveViewModel: ObservableObject {
         Task { @MainActor in
             guard context.timestamp >= self.latestCameraTimestamp else { return }
             self.latestCameraTimestamp = context.timestamp
-            self.cameraPixelBuffer = pixelBuffer
-            self.imageResolution = context.imageResolution
-            self.updateMiniMapCamera(with: context)
+            self.cameraPreviewSource.publish(pixelBuffer)
+            if self.imageResolution != context.imageResolution {
+                self.imageResolution = context.imageResolution
+            }
+            self.updateMiniMapCameraIfNeeded(with: context)
             self.updateNavigationProgress()
         }
 
@@ -319,6 +325,13 @@ final class DriveViewModel: ObservableObject {
         )
     }
 
+    private func updateMiniMapCameraIfNeeded(with context: ARFrameContext) {
+        let now = CACurrentMediaTime()
+        guard now - lastMiniMapCameraUpdateTime >= miniMapCameraUpdateInterval else { return }
+        lastMiniMapCameraUpdateTime = now
+        updateMiniMapCamera(with: context)
+    }
+
     func setMiniMapPresentationMode(_ mode: MiniMapService.PresentationMode) {
         miniMapService.setPresentationMode(mode)
     }
@@ -390,6 +403,7 @@ final class DriveViewModel: ObservableObject {
         lastRouteRefreshPosition = nil
         lastRouteRefreshTime = 0
         miniMapService.updateNavigationRoute([], targetLandmarkID: nil)
+        miniMapService.clearOccupancyGrid()
     }
 
     // MARK: - Navigation Progress
@@ -414,7 +428,7 @@ final class DriveViewModel: ObservableObject {
 
         // Check arrival at final destination
         guard let last = navigationRoute.last else { return }
-        if simd_distance(userFlat, SIMD2<Float>(last.x, last.z)) < 1.5 {
+        if simd_distance(userFlat, SIMD2<Float>(last.x, last.z)) < 1.0 {
             handleArrival()
         }
     }
@@ -442,6 +456,8 @@ final class DriveViewModel: ObservableObject {
         lastRouteRefreshPosition = start
         lastRouteRefreshTime = CACurrentMediaTime()
         updateDisplayedNavigationRoute(from: start)
+        // Refresh occupancy grid debug overlay so the user can inspect explored/obstacle cells.
+        miniMapService.updateOccupancyGrid(navigationService.occupancySnapshot())
     }
 
     private func invalidatePendingNavigationRequest() {

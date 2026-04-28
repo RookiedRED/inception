@@ -9,11 +9,76 @@ import UIKit
 import QuartzCore
 import Accelerate
 import CoreImage
+import CoreML
 import CoreVideo
 import OnnxRuntimeBindings
 
 /// Handles image preprocessing, ONNX Runtime execution, and model-output decoding.
 final class InferenceService {
+
+    struct Configuration {
+        enum Backend: CustomStringConvertible {
+            case ort
+            case coreMLPackage
+
+            var description: String {
+                switch self {
+                case .ort:
+                    return "ort"
+                case .coreMLPackage:
+                    return "coreMLPackage"
+                }
+            }
+        }
+
+        enum ExecutionProfile {
+            case cpuOnly
+            case cpuAndNeuralEngine
+            case all
+
+            var coreMLComputeUnitsValue: String? {
+                switch self {
+                case .cpuOnly:
+                    return nil
+                case .cpuAndNeuralEngine:
+                    return "CPUAndNeuralEngine"
+                case .all:
+                    return "ALL"
+                }
+            }
+
+            var intraOpThreadCount: Int32 {
+                switch self {
+                case .cpuOnly:
+                    return 4
+                case .cpuAndNeuralEngine, .all:
+                    return 1
+                }
+            }
+        }
+
+        let inputSize: Int
+        let backend: Backend
+        let executionProfile: ExecutionProfile
+        let ortModelResourceName: String
+        let coreMLModelResourceName: String
+
+        static let realtimeARORT = Configuration(
+            inputSize: 640,
+            backend: .ort,
+            executionProfile: .cpuAndNeuralEngine,
+            ortModelResourceName: "yolo26n",
+            coreMLModelResourceName: "yolo26n"
+        )
+
+        static let realtimeARCoreML = Configuration(
+            inputSize: 640,
+            backend: .coreMLPackage,
+            executionProfile: .cpuAndNeuralEngine,
+            ortModelResourceName: "yolo26n",
+            coreMLModelResourceName: "yolo26n"
+        )
+    }
 
     /// Stores the letterbox transform required to map detections back into source-image space.
     private struct PreprocessMapping {
@@ -28,7 +93,8 @@ final class InferenceService {
 
     private let confThreshold: Float = 0.25
     private let iouThreshold: Float = 0.45
-    private let inputSize: Int = 640
+    private let configuration: Configuration
+    private var inputSize: Int { configuration.inputSize }
 
     /// Input/output tensor names expected by the bundled model.
     private let inputName = "images"
@@ -38,6 +104,11 @@ final class InferenceService {
 
     private var session: ORTSession?
     private var ortEnv: ORTEnv?
+    private var coreMLModel: MLModel?
+    private var coreMLInputName: String?
+    private var coreMLOutputName: String?
+    private var coreMLInputIsImage = false
+    private var coreMLInputMultiArray: MLMultiArray?
 
     // MARK: - Queues and Render Context
 
@@ -49,11 +120,14 @@ final class InferenceService {
         .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
         .outputColorSpace: CGColorSpaceCreateDeviceRGB()
     ])
+    private var letterboxBackgroundImage: CIImage?
 
     // MARK: - Mutable State
 
     private var hasLoggedShape = false
+    private var hasLoggedCoreMLPredictionLayout = false
     private var transpositionBuffer = [Float32]()
+    private var outputConversionBuffer = [Float32]()
 
     // MARK: - Reusable Buffers
 
@@ -75,7 +149,8 @@ final class InferenceService {
 
     // MARK: - Init
 
-    init() {
+    init(configuration: Configuration = .realtimeARORT) {
+        self.configuration = configuration
         prepareReusableBuffers()
         setupQueue.async { [weak self] in
             self?.setupModel()
@@ -97,17 +172,10 @@ final class InferenceService {
                 return
             }
 
-            guard let session = self.session else {
-                DispatchQueue.main.async {
-                    completion(.failure(InferenceError.sessionNotReady))
-                }
-                return
-            }
-
             autoreleasepool {
                 let t0 = CACurrentMediaTime()
 
-                guard let mapping = self.preprocessIntoReusableBuffer(pixelBuffer) else {
+                guard let preparedInput = self.preprocess(pixelBuffer) else {
                     DispatchQueue.main.async {
                         completion(.success(InferenceResult(detections: [], inferenceMs: 0)))
                     }
@@ -115,41 +183,19 @@ final class InferenceService {
                 }
 
                 do {
-                    guard let inputTensor = self.inputTensor else {
-                        DispatchQueue.main.async {
-                            completion(.success(InferenceResult(detections: [], inferenceMs: 0)))
-                        }
-                        return
+                    let detections: [Detection]
+                    switch self.configuration.backend {
+                    case .ort:
+                        detections = try self.runORTInference(
+                            using: preparedInput.pixelBuffer,
+                            mapping: preparedInput.mapping
+                        )
+                    case .coreMLPackage:
+                        detections = try self.runCoreMLInference(
+                            using: preparedInput.pixelBuffer,
+                            mapping: preparedInput.mapping
+                        )
                     }
-
-                    let outputs = try session.run(
-                        withInputs: [self.inputName: inputTensor],
-                        outputNames: Set([self.outputName]),
-                        runOptions: nil
-                    )
-
-                    guard let outputValue = outputs[self.outputName] else {
-                        DispatchQueue.main.async {
-                            completion(.success(InferenceResult(detections: [], inferenceMs: 0)))
-                        }
-                        return
-                    }
-
-                    let shapeInfo = try outputValue.tensorTypeAndShapeInfo()
-                    let shape = shapeInfo.shape.map { $0.intValue }
-
-                    if !self.hasLoggedShape {
-                        self.hasLoggedShape = true
-                        print("📐 \(self.outputName) shape: \(shape)")
-                    }
-
-                    // `tensorData()` is already backed by ORT-managed storage.
-                    let outputTensorData = try outputValue.tensorData()
-                    let detections = self.parseDetections(
-                        fromTensorData: outputTensorData,
-                        shape: shape,
-                        mapping: mapping
-                    )
 
                     let t2 = CACurrentMediaTime()
 
@@ -190,24 +236,38 @@ final class InferenceService {
 
     /// Loads and configures the ONNX Runtime session.
     private func setupModel() {
+        switch configuration.backend {
+        case .ort:
+            setupORTModel()
+        case .coreMLPackage:
+            setupCoreMLModel()
+        }
+    }
+
+    private func setupORTModel() {
         do {
             let env = try ORTEnv(loggingLevel: .warning)
             ortEnv = env
 
-            guard let modelPath = Bundle.main.path(forResource: "yolo26n", ofType: "ort") else {
-                print("❌ 找不到 yolo26n.ort（請確認已加入 Target Membership）")
+            guard let modelPath = Bundle.main.path(
+                forResource: configuration.ortModelResourceName,
+                ofType: "ort"
+            ) else {
+                print("❌ 找不到 \(configuration.ortModelResourceName).ort（請確認已加入 Target Membership）")
                 return
             }
 
             let options = try ORTSessionOptions()
 
-            try options.setIntraOpNumThreads(2)
+            try options.setIntraOpNumThreads(configuration.executionProfile.intraOpThreadCount)
 
-            // Prefer CPU + Neural Engine to reduce thermals during continuous AR usage.
-            try options.appendCoreMLExecutionProvider(withOptionsV2: [
-                "MLComputeUnits": "CPUAndNeuralEngine",
-                "ModelFormat": "MLProgram"
-            ])
+            if let computeUnits = configuration.executionProfile.coreMLComputeUnitsValue {
+                // For live AR, prefer ANE-backed execution and keep CPU headroom for camera/depth work.
+                try options.appendCoreMLExecutionProvider(withOptionsV2: [
+                    "MLComputeUnits": computeUnits,
+                    "ModelFormat": "MLProgram"
+                ])
+            }
 
             let s = try ORTSession(env: env, modelPath: modelPath, sessionOptions: options)
             session = s
@@ -218,10 +278,98 @@ final class InferenceService {
                 print("📤 Output names: \(outputNames)")
             }
 
-            print("✅ ORT 模型載入成功（CoreML EP 已啟用）")
+            print("✅ ORT 模型載入成功（input: \(inputSize), profile: \(configuration.executionProfile)）")
         } catch {
             print("❌ ORT 模型載入失敗：\(error)")
         }
+    }
+
+    private func setupCoreMLModel() {
+        do {
+            guard let modelURL = Bundle.main.url(
+                forResource: configuration.coreMLModelResourceName,
+                withExtension: "mlmodelc"
+            ) else {
+                print("❌ 找不到 \(configuration.coreMLModelResourceName).mlmodelc（請確認 mlpackage 已加入 Target Membership）")
+                return
+            }
+
+            let modelConfig = MLModelConfiguration()
+            modelConfig.computeUnits = configuration.executionProfile.mlComputeUnits
+
+            let model = try MLModel(contentsOf: modelURL, configuration: modelConfig)
+            coreMLModel = model
+
+            let inputDescriptions = model.modelDescription.inputDescriptionsByName
+            if let imageInput = inputDescriptions.first(where: { $0.value.type == .image }) {
+                coreMLInputName = imageInput.key
+                coreMLInputIsImage = true
+            } else if let multiArrayInput = inputDescriptions.first(where: { $0.value.type == .multiArray }) {
+                coreMLInputName = multiArrayInput.key
+                coreMLInputIsImage = false
+                let shape = multiArrayInput.value.multiArrayConstraint?.shape ?? [1, 3, inputSize as NSNumber, inputSize as NSNumber]
+                coreMLInputMultiArray = try? MLMultiArray(shape: shape, dataType: .float32)
+            }
+
+            coreMLOutputName = selectCoreMLOutputName(from: model.modelDescription.outputDescriptionsByName)
+
+            print("✅ Core ML 模型載入成功（backend: \(configuration.backend), computeUnits: \(configuration.executionProfile.mlComputeUnits)）")
+            print("📥 Core ML inputs: \(Array(inputDescriptions.keys).sorted())")
+            print("📤 Core ML outputs: \(Array(model.modelDescription.outputDescriptionsByName.keys).sorted())")
+            for (name, description) in model.modelDescription.outputDescriptionsByName.sorted(by: { $0.key < $1.key }) {
+                if let shape = description.multiArrayConstraint?.shape {
+                    print("   output \(name): multiArray shape=\(shape)")
+                } else {
+                    print("   output \(name): type=\(description.type.rawValue)")
+                }
+            }
+            if let coreMLOutputName {
+                print("🎯 Selected Core ML output: \(coreMLOutputName)")
+            }
+        } catch {
+            print("❌ Core ML 模型載入失敗：\(error)")
+        }
+    }
+
+    private func selectCoreMLOutputName(from outputs: [String: MLFeatureDescription]) -> String? {
+        if outputs.keys.contains(outputName) {
+            return outputName
+        }
+
+        let sortedCandidates = outputs
+            .filter { $0.value.type == .multiArray }
+            .sorted { lhs, rhs in
+                let lhsScore = coreMLOutputSelectionScore(for: lhs.value)
+                let rhsScore = coreMLOutputSelectionScore(for: rhs.value)
+                if lhsScore == rhsScore {
+                    return lhs.key < rhs.key
+                }
+                return lhsScore > rhsScore
+            }
+
+        return sortedCandidates.first?.key
+    }
+
+    private func coreMLOutputSelectionScore(for description: MLFeatureDescription) -> Int {
+        guard let shape = description.multiArrayConstraint?.shape.map({ $0.intValue }), shape.count >= 2 else {
+            return 0
+        }
+
+        let trailingA = shape[shape.count - 2]
+        let trailingB = shape[shape.count - 1]
+        let maxDim = max(trailingA, trailingB)
+        let minDim = min(trailingA, trailingB)
+
+        if maxDim >= 80, minDim >= 4 {
+            return 3
+        }
+        if maxDim >= 80 {
+            return 2
+        }
+        if minDim >= 4 {
+            return 1
+        }
+        return 0
     }
 
     private static func makePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
@@ -251,13 +399,16 @@ final class InferenceService {
 
     // MARK: - Preprocessing
 
-    /// Converts a camera frame into normalized NCHW float input expected by the model.
+    private struct PreparedInput {
+        let pixelBuffer: CVPixelBuffer
+        let mapping: PreprocessMapping
+    }
 
-    private func preprocessIntoReusableBuffer(_ pixelBuffer: CVPixelBuffer) -> PreprocessMapping? {
+    /// Renders the incoming frame into the fixed-size model input buffer and returns the letterbox mapping.
+    private func preprocess(_ pixelBuffer: CVPixelBuffer) -> PreparedInput? {
         guard let outputBuffer = resizedPixelBuffer else { return nil }
 
         let size = inputSize
-        let planeSize = size * size
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let sourceWidth = ciImage.extent.width
@@ -285,17 +436,33 @@ final class InferenceService {
             by: CGAffineTransform(scaleX: mapping.scale, y: mapping.scale)
                 .concatenating(CGAffineTransform(translationX: mapping.offsetX, y: mapping.offsetY))
         )
-        let background = CIImage(color: .black).cropped(to: CGRect(x: 0, y: 0, width: size, height: size))
+        let background: CIImage
+        if let letterboxBackgroundImage {
+            background = letterboxBackgroundImage
+        } else {
+            let image = CIImage(color: .black).cropped(to: CGRect(x: 0, y: 0, width: size, height: size))
+            letterboxBackgroundImage = image
+            background = image
+        }
         let letterboxed = transformedImage.composited(over: background)
 
         ciContext.render(letterboxed, to: outputBuffer)
 
-        CVPixelBufferLockBaseAddress(outputBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(outputBuffer, .readOnly) }
+        return PreparedInput(pixelBuffer: outputBuffer, mapping: mapping)
+    }
 
-        guard let baseAddress = CVPixelBufferGetBaseAddress(outputBuffer) else { return nil }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
+    private func fillORTInputTensor(from pixelBuffer: CVPixelBuffer) throws {
+        let size = inputSize
+        let planeSize = size * size
 
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw InferenceError.invalidPreprocessedBuffer
+        }
+
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         var srcVBuf = vImage_Buffer(
             data: baseAddress,
             height: vImagePixelCount(size),
@@ -306,26 +473,10 @@ final class InferenceService {
         rBytes.withUnsafeMutableBufferPointer { rPtr in
             gBytes.withUnsafeMutableBufferPointer { gPtr in
                 bBytes.withUnsafeMutableBufferPointer { bPtr in
-                    var rBuf = vImage_Buffer(
-                        data: rPtr.baseAddress!,
-                        height: vImagePixelCount(size),
-                        width: vImagePixelCount(size),
-                        rowBytes: size
-                    )
-                    var gBuf = vImage_Buffer(
-                        data: gPtr.baseAddress!,
-                        height: vImagePixelCount(size),
-                        width: vImagePixelCount(size),
-                        rowBytes: size
-                    )
-                    var bBuf = vImage_Buffer(
-                        data: bPtr.baseAddress!,
-                        height: vImagePixelCount(size),
-                        width: vImagePixelCount(size),
-                        rowBytes: size
-                    )
+                    var rBuf = vImage_Buffer(data: rPtr.baseAddress!, height: vImagePixelCount(size), width: vImagePixelCount(size), rowBytes: size)
+                    var gBuf = vImage_Buffer(data: gPtr.baseAddress!, height: vImagePixelCount(size), width: vImagePixelCount(size), rowBytes: size)
+                    var bBuf = vImage_Buffer(data: bPtr.baseAddress!, height: vImagePixelCount(size), width: vImagePixelCount(size), rowBytes: size)
 
-                    // BGRA: B=0, G=1, R=2, A=3
                     vImageExtractChannel_ARGB8888(&srcVBuf, &rBuf, 2, vImage_Flags(kvImageNoFlags))
                     vImageExtractChannel_ARGB8888(&srcVBuf, &gBuf, 1, vImage_Flags(kvImageNoFlags))
                     vImageExtractChannel_ARGB8888(&srcVBuf, &bBuf, 0, vImage_Flags(kvImageNoFlags))
@@ -333,20 +484,102 @@ final class InferenceService {
             }
         }
 
-        // Write normalized floats directly into the reusable tensor backing store.
         var normalizationScale: Float = 1.0 / 255.0
         let dst = inputMutableData.mutableBytes.assumingMemoryBound(to: Float32.self)
 
         vDSP_vfltu8(rBytes, 1, dst + 0 * planeSize, 1, vDSP_Length(planeSize))
         vDSP_vsmul(dst + 0 * planeSize, 1, &normalizationScale, dst + 0 * planeSize, 1, vDSP_Length(planeSize))
-
         vDSP_vfltu8(gBytes, 1, dst + 1 * planeSize, 1, vDSP_Length(planeSize))
         vDSP_vsmul(dst + 1 * planeSize, 1, &normalizationScale, dst + 1 * planeSize, 1, vDSP_Length(planeSize))
-
         vDSP_vfltu8(bBytes, 1, dst + 2 * planeSize, 1, vDSP_Length(planeSize))
         vDSP_vsmul(dst + 2 * planeSize, 1, &normalizationScale, dst + 2 * planeSize, 1, vDSP_Length(planeSize))
+    }
 
-        return mapping
+    private func populateCoreMLInputMultiArray(from pixelBuffer: CVPixelBuffer) throws -> MLMultiArray {
+        guard let inputMultiArray = coreMLInputMultiArray else {
+            throw InferenceError.unsupportedCoreMLInput
+        }
+
+        try fillORTInputTensor(from: pixelBuffer)
+
+        let floatCount = inputSize * inputSize * 3
+        let src = inputMutableData.mutableBytes.assumingMemoryBound(to: Float32.self)
+        let dst = inputMultiArray.dataPointer.assumingMemoryBound(to: Float32.self)
+        dst.update(from: src, count: floatCount)
+        return inputMultiArray
+    }
+
+    private func runORTInference(using pixelBuffer: CVPixelBuffer, mapping: PreprocessMapping) throws -> [Detection] {
+        guard let session else {
+            throw InferenceError.sessionNotReady
+        }
+        guard let inputTensor else {
+            throw InferenceError.invalidORTInputTensor
+        }
+
+        try fillORTInputTensor(from: pixelBuffer)
+
+        let outputs = try session.run(
+            withInputs: [inputName: inputTensor],
+            outputNames: Set([outputName]),
+            runOptions: nil
+        )
+
+        guard let outputValue = outputs[outputName] else { return [] }
+        let shapeInfo = try outputValue.tensorTypeAndShapeInfo()
+        let shape = shapeInfo.shape.map { $0.intValue }
+
+        if !hasLoggedShape {
+            hasLoggedShape = true
+            print("📐 \(outputName) shape: \(shape)")
+        }
+
+        let outputTensorData = try outputValue.tensorData()
+        return parseDetections(fromTensorData: outputTensorData, shape: shape, mapping: mapping)
+    }
+
+    private func runCoreMLInference(using pixelBuffer: CVPixelBuffer, mapping: PreprocessMapping) throws -> [Detection] {
+        guard let coreMLModel, let inputName = coreMLInputName, let outputName = coreMLOutputName else {
+            throw InferenceError.sessionNotReady
+        }
+
+        let inputValue: MLFeatureValue
+        if coreMLInputIsImage {
+            inputValue = MLFeatureValue(pixelBuffer: pixelBuffer)
+        } else {
+            let inputMultiArray = try populateCoreMLInputMultiArray(from: pixelBuffer)
+            inputValue = MLFeatureValue(multiArray: inputMultiArray)
+        }
+
+        let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: inputValue])
+        let prediction = try coreMLModel.prediction(from: provider)
+        if !hasLoggedCoreMLPredictionLayout {
+            hasLoggedCoreMLPredictionLayout = true
+            logCoreMLPredictionLayout(prediction, selectedOutputName: outputName)
+        }
+        guard let outputValue = prediction.featureValue(for: outputName),
+              let outputMultiArray = outputValue.multiArrayValue else {
+            throw InferenceError.unsupportedCoreMLOutput
+        }
+
+        return parseDetections(from: outputMultiArray, mapping: mapping)
+    }
+
+    private func logCoreMLPredictionLayout(_ prediction: MLFeatureProvider, selectedOutputName: String) {
+        let sortedNames = prediction.featureNames.sorted()
+        print("🧾 Core ML prediction features: \(sortedNames)")
+        for name in sortedNames {
+            guard let value = prediction.featureValue(for: name) else { continue }
+            if let multiArray = value.multiArrayValue {
+                let shape = multiArray.shape.map { $0.intValue }
+                print("   feature \(name): multiArray shape=\(shape) type=\(multiArray.dataType.rawValue)")
+            } else if value.type == .dictionary {
+                print("   feature \(name): dictionary")
+            } else {
+                print("   feature \(name): type=\(value.type.rawValue)")
+            }
+        }
+        print("🎯 Using Core ML prediction feature: \(selectedOutputName)")
     }
 
     // MARK: - Output Parsing
@@ -360,6 +593,179 @@ final class InferenceService {
         guard tensorData.length > 0 else { return [] }
         let ptr = tensorData.bytes.assumingMemoryBound(to: Float32.self)
         return parseDetections(from: ptr, shape: shape, mapping: mapping)
+    }
+
+    private func parseDetections(
+        from multiArray: MLMultiArray,
+        mapping: PreprocessMapping
+    ) -> [Detection] {
+        let shape = multiArray.shape.map { $0.intValue }
+        if let detections = parseNMSDetectionsIfAvailable(from: multiArray, shape: shape, mapping: mapping) {
+            return detections
+        }
+
+        let scalarCount = shape.reduce(1, *)
+
+        switch multiArray.dataType {
+        case .float32:
+            let ptr = multiArray.dataPointer.assumingMemoryBound(to: Float32.self)
+            return parseDetections(from: ptr, shape: shape, mapping: mapping)
+        case .double:
+            if outputConversionBuffer.count < scalarCount {
+                outputConversionBuffer = [Float32](repeating: 0, count: scalarCount)
+            }
+            let ptr = multiArray.dataPointer.assumingMemoryBound(to: Double.self)
+            for index in 0..<scalarCount {
+                outputConversionBuffer[index] = Float32(ptr[index])
+            }
+            return outputConversionBuffer.withUnsafeBufferPointer { buffer in
+                guard let baseAddress = buffer.baseAddress else { return [] }
+                return parseDetections(from: baseAddress, shape: shape, mapping: mapping)
+            }
+        case .float16:
+            if outputConversionBuffer.count < scalarCount {
+                outputConversionBuffer = [Float32](repeating: 0, count: scalarCount)
+            }
+            let ptr = multiArray.dataPointer.assumingMemoryBound(to: UInt16.self)
+            for index in 0..<scalarCount {
+                outputConversionBuffer[index] = Float32(Float16(bitPattern: ptr[index]))
+            }
+            return outputConversionBuffer.withUnsafeBufferPointer { buffer in
+                guard let baseAddress = buffer.baseAddress else { return [] }
+                return parseDetections(from: baseAddress, shape: shape, mapping: mapping)
+            }
+        default:
+            return []
+        }
+    }
+
+    private func parseNMSDetectionsIfAvailable(
+        from multiArray: MLMultiArray,
+        shape: [Int],
+        mapping: PreprocessMapping
+    ) -> [Detection]? {
+        guard shape.count >= 2 else { return nil }
+
+        let candidateWidth = shape[shape.count - 1]
+        let candidateCount = shape[shape.count - 2]
+        guard candidateWidth == 6, candidateCount > 0 else { return nil }
+
+        let scalarCount = shape.reduce(1, *)
+        guard scalarCount >= candidateCount * candidateWidth else { return nil }
+
+        let values: [Float32]
+        switch multiArray.dataType {
+        case .float32:
+            let ptr = multiArray.dataPointer.assumingMemoryBound(to: Float32.self)
+            values = Array(UnsafeBufferPointer(start: ptr, count: scalarCount))
+        case .double:
+            let ptr = multiArray.dataPointer.assumingMemoryBound(to: Double.self)
+            values = (0..<scalarCount).map { Float32(ptr[$0]) }
+        case .float16:
+            let ptr = multiArray.dataPointer.assumingMemoryBound(to: UInt16.self)
+            values = (0..<scalarCount).map { Float32(Float16(bitPattern: ptr[$0])) }
+        default:
+            return nil
+        }
+
+        var detections: [Detection] = []
+        detections.reserveCapacity(min(candidateCount, 64))
+
+        for index in 0..<candidateCount {
+            let base = index * candidateWidth
+            let a = values[base + 0]
+            let b = values[base + 1]
+            let c = values[base + 2]
+            let d = values[base + 3]
+            let confidence = values[base + 4]
+            let classId = Int(values[base + 5].rounded())
+
+            guard confidence.isFinite, confidence >= confThreshold else { continue }
+            guard classId >= 0 else { continue }
+
+            appendCoreMLNMSDetection(
+                a: a,
+                b: b,
+                c: c,
+                d: d,
+                classId: classId,
+                confidence: confidence,
+                mapping: mapping,
+                to: &detections
+            )
+        }
+
+        return detections
+    }
+
+    private func appendCoreMLNMSDetection(
+        a: Float,
+        b: Float,
+        c: Float,
+        d: Float,
+        classId: Int,
+        confidence: Float,
+        mapping: PreprocessMapping,
+        to detections: inout [Detection]
+    ) {
+        // Most Core ML YOLO exports with shape [1, N, 6] emit x1, y1, x2, y2, confidence, classId.
+        var modelMinX = CGFloat(a)
+        var modelMinY = CGFloat(b)
+        var modelMaxX = CGFloat(c)
+        var modelMaxY = CGFloat(d)
+
+        // Fallback for exporters that emit cx, cy, w, h instead of xyxy.
+        if modelMaxX <= modelMinX || modelMaxY <= modelMinY {
+            let cx = CGFloat(a)
+            let cy = CGFloat(b)
+            let width = CGFloat(c)
+            let height = CGFloat(d)
+            modelMinX = cx - width * 0.5
+            modelMinY = cy - height * 0.5
+            modelMaxX = cx + width * 0.5
+            modelMaxY = cy + height * 0.5
+        }
+
+        let coordsLookNormalized = max(modelMaxX, modelMaxY) <= 2.0
+        if coordsLookNormalized {
+            let x = max(0, min(1, modelMinX))
+            let y = max(0, min(1, modelMinY))
+            let maxX = max(0, min(1, modelMaxX))
+            let maxY = max(0, min(1, modelMaxY))
+            guard maxX > x, maxY > y else { return }
+
+            detections.append(
+                Detection(
+                    bbox: CGRect(x: x, y: y, width: maxX - x, height: maxY - y),
+                    classId: classId,
+                    className: classId < COCO_CLASSES.count ? COCO_CLASSES[classId] : "unknown",
+                    confidence: confidence,
+                    maskCoeffs: []
+                )
+            )
+            return
+        }
+
+        let sourceMinX = (modelMinX - mapping.offsetX) / mapping.scale
+        let sourceMinY = (modelMinY - mapping.offsetY) / mapping.scale
+        let sourceMaxX = (modelMaxX - mapping.offsetX) / mapping.scale
+        let sourceMaxY = (modelMaxY - mapping.offsetY) / mapping.scale
+
+        let x = max(0, min(1, sourceMinX / mapping.sourceWidth))
+        let y = max(0, min(1, sourceMinY / mapping.sourceHeight))
+        let maxX = max(0, min(1, sourceMaxX / mapping.sourceWidth))
+        let maxY = max(0, min(1, sourceMaxY / mapping.sourceHeight))
+        guard maxX > x, maxY > y else { return }
+
+        detections.append(
+            Detection(
+                bbox: CGRect(x: x, y: y, width: maxX - x, height: maxY - y),
+                classId: classId,
+                className: classId < COCO_CLASSES.count ? COCO_CLASSES[classId] : "unknown",
+                confidence: confidence,
+                maskCoeffs: []
+            )
+        )
     }
 
     /// Supports both `[C, N]` and `[N, C]` layouts emitted by YOLO-family models.
@@ -557,6 +963,30 @@ final class InferenceService {
 
 }
 
+extension InferenceService.Configuration.ExecutionProfile: CustomStringConvertible {
+    var description: String {
+        switch self {
+        case .cpuOnly:
+            return "cpuOnly"
+        case .cpuAndNeuralEngine:
+            return "cpuAndNeuralEngine"
+        case .all:
+            return "all"
+        }
+    }
+
+    var mlComputeUnits: MLComputeUnits {
+        switch self {
+        case .cpuOnly:
+            return .cpuOnly
+        case .cpuAndNeuralEngine:
+            return .cpuAndNeuralEngine
+        case .all:
+            return .all
+        }
+    }
+}
+
 // MARK: - Result Types
 
 /// Result returned to the view model after a single inference pass.
@@ -571,6 +1001,10 @@ struct InferenceResult {
 enum InferenceError: LocalizedError {
     case sessionNotReady
     case serviceDeallocated
+    case invalidPreprocessedBuffer
+    case invalidORTInputTensor
+    case unsupportedCoreMLInput
+    case unsupportedCoreMLOutput
 
     var errorDescription: String? {
         switch self {
@@ -578,6 +1012,14 @@ enum InferenceError: LocalizedError {
             return "Inference session 尚未初始化完成"
         case .serviceDeallocated:
             return "InferenceService 已被釋放"
+        case .invalidPreprocessedBuffer:
+            return "前處理後的影像 buffer 無效"
+        case .invalidORTInputTensor:
+            return "ORT input tensor 尚未初始化完成"
+        case .unsupportedCoreMLInput:
+            return "Core ML 模型輸入格式目前不支援"
+        case .unsupportedCoreMLOutput:
+            return "Core ML 模型輸出格式目前不支援"
         }
     }
 }

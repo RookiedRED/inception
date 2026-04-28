@@ -11,12 +11,14 @@
 		612E1D2A2F8F439600F8E603 /* onnxruntime_extensions in Frameworks */ = {isa = PBXBuildFile; productRef = 612E1D292F8F439600F8E603 /* onnxruntime_extensions */; };
 		612E1D462F90877100F8E603 /* yolo26n.onnx in Resources */ = {isa = PBXBuildFile; fileRef = 612E1D452F90877100F8E603 /* yolo26n.onnx */; };
 		612E1D4A2F90A27E00F8E603 /* yolo26n.ort in Resources */ = {isa = PBXBuildFile; fileRef = 612E1D492F90A27E00F8E603 /* yolo26n.ort */; };
+		61DED23B2FA06A7900D1C208 /* yolo26n.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 61DED23A2FA06A7900D1C208 /* yolo26n.mlpackage */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		612E1CE92F8EDE5000F8E603 /* inception.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = inception.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		612E1D452F90877100F8E603 /* yolo26n.onnx */ = {isa = PBXFileReference; lastKnownFileType = file; path = yolo26n.onnx; sourceTree = "<group>"; };
 		612E1D492F90A27E00F8E603 /* yolo26n.ort */ = {isa = PBXFileReference; lastKnownFileType = file; path = yolo26n.ort; sourceTree = "<group>"; };
+		61DED23A2FA06A7900D1C208 /* yolo26n.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo26n.mlpackage; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -43,6 +45,7 @@
 		612E1CE02F8EDE5000F8E603 = {
 			isa = PBXGroup;
 			children = (
+				61DED23A2FA06A7900D1C208 /* yolo26n.mlpackage */,
 				612E1CEB2F8EDE5000F8E603 /* inception */,
 				612E1CEA2F8EDE5000F8E603 /* Products */,
 				612E1D452F90877100F8E603 /* yolo26n.onnx */,
@@ -139,6 +142,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				61DED23B2FA06A7900D1C208 /* yolo26n.mlpackage in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

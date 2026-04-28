@@ -15,10 +15,12 @@ import simd
 /// Coordinates the AR session, inference pipeline, minimap state, and navigation UI.
 final class DriveViewModel: ObservableObject {
 
+    private static let inferenceBackend: InferenceService.Configuration.Backend = .coreMLPackage
+
     // MARK: - Services
 
     let cameraService = ARCameraService()
-    let inferenceService = InferenceService()
+    let inferenceService = DriveViewModel.makeInferenceService()
     let miniMapService = MiniMapService()
     let landmarkStore = LandmarkStore()
     let navigationService = NavigationService()
@@ -49,6 +51,17 @@ final class DriveViewModel: ObservableObject {
     @Published var navigationRoute: [simd_float3] = []
 
     let cameraPreviewSource = CameraPreviewSource()
+
+    private static func makeInferenceService() -> InferenceService {
+        let configuration: InferenceService.Configuration
+        switch inferenceBackend {
+        case .ort:
+            configuration = .realtimeARORT
+        case .coreMLPackage:
+            configuration = .realtimeARCoreML
+        }
+        return InferenceService(configuration: configuration)
+    }
 
     private var navigationTargetID: UUID?
     /// Index into `navigationRoute` of the next waypoint to reach.

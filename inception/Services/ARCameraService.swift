@@ -189,53 +189,6 @@ final class ARCameraService: NSObject {
         endProcessing()
     }
 
-    // MARK: - Frame Copying
-
-    /// Creates an independent image copy so the source `ARFrame` can be released immediately.
-    static func copyPixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {
-        let width = CVPixelBufferGetWidth(src)
-        let height = CVPixelBufferGetHeight(src)
-        let format = CVPixelBufferGetPixelFormatType(src)
-
-        let attrs: [String: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-        ]
-        var dst: CVPixelBuffer?
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, format, attrs as CFDictionary, &dst) == kCVReturnSuccess,
-              let dst else { return nil }
-
-        CVPixelBufferLockBaseAddress(src, .readOnly)
-        CVPixelBufferLockBaseAddress(dst, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(src, .readOnly)
-            CVPixelBufferUnlockBaseAddress(dst, [])
-        }
-
-        let planeCount = CVPixelBufferGetPlaneCount(src)
-        if planeCount > 0 {
-            for plane in 0..<planeCount {
-                guard let srcAddr = CVPixelBufferGetBaseAddressOfPlane(src, plane),
-                      let dstAddr = CVPixelBufferGetBaseAddressOfPlane(dst, plane) else { continue }
-                let srcBPR = CVPixelBufferGetBytesPerRowOfPlane(src, plane)
-                let dstBPR = CVPixelBufferGetBytesPerRowOfPlane(dst, plane)
-                let rows = CVPixelBufferGetHeightOfPlane(src, plane)
-                let copyBytes = min(srcBPR, dstBPR)
-                for row in 0..<rows {
-                    memcpy(dstAddr.advanced(by: row * dstBPR),
-                           srcAddr.advanced(by: row * srcBPR),
-                           copyBytes)
-                }
-            }
-        } else {
-            guard let srcAddr = CVPixelBufferGetBaseAddress(src),
-                  let dstAddr = CVPixelBufferGetBaseAddress(dst) else { return nil }
-            let bpr = CVPixelBufferGetBytesPerRow(src)
-            memcpy(dstAddr, srcAddr, bpr * height)
-        }
-
-        return dst
-    }
-
     // MARK: - Mesh Publishing
 
     /// Throttles mesh-anchor publication to avoid rebuilding minimap geometry every frame.
@@ -316,22 +269,15 @@ extension ARCameraService: ARSessionDelegate {
             timestamp: frame.timestamp
         )
 
-        let t0 = CACurrentMediaTime()
-        guard let copiedBuffer = Self.copyPixelBuffer(frame.capturedImage) else {
-            dbg.recordCopyFail()
-            endProcessing()
-            return
-        }
-        let t1 = CACurrentMediaTime()
-        dbg.recordCopyTime((t1 - t0) * 1000)
-
         guard let handler = onFrame else {
             dbg.recordCallbackNil()
             endProcessing()
             return
         }
 
-        handler(copiedBuffer, context)
+        // Avoid a full-frame memcpy on every accepted frame. The downstream pipeline keeps only
+        // one frame in flight, which bounds retention while reducing copy overhead.
+        handler(frame.capturedImage, context)
 
         publishMeshAnchorsIfNeeded(timestamp: frame.timestamp)
     }
